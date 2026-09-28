@@ -1,0 +1,67 @@
+{
+  "name": "pi-terminal-worker",
+  "version": "0.1.0",
+  "description": "Pi coding agent extension for supervised worker Pi in independent Windows Terminal window with bi-directional IPC",
+  "type": "module",
+  "main": "./dist/extension.js",
+  "types": "./dist/extension.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/extension.d.ts",
+      "import": "./dist/extension.js"
+    }
+  },
+  "files": [
+    "dist",
+    "runtime",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent",
+    "windows-terminal",
+    "subagent",
+    "worker"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/extension.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/**/*.test.ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mozhi012/pi-terminal-worker.git"
+  },
+  "author": "mozhi012 <mozhi0012@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/mozhi012/pi-terminal-worker/issues"
+  },
+  "homepage": "https://github.com/mozhi012/pi-terminal-worker#readme",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.87.0",
+    "typebox": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@types/node": "^22.13.0",
+    "typebox": "^1.3.27",
+    "typescript": "^5.7.3"
+  }
+}
