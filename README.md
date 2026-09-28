@@ -14,7 +14,7 @@
 ## 安装
 
 ```bash
-pi install npm:pi-terminal-worker
+pi install npm:@mozhi0012/pi-terminal-worker
 ```
 
 或者本地开发加载：
