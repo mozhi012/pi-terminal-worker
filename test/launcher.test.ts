@@ -52,6 +52,7 @@ describe("Launcher and Descriptor Tests", () => {
   });
 
   it("validateAndPrepareLaunch 严格拒绝不合法的 cwd 路径", () => {
+    process.env.PI_TEST_MOCK_PLATFORM = "win32";
     // 相对路径
     assert.throws(
       () => validateAndPrepareLaunch("relative/path"),

@@ -28,8 +28,11 @@ jobs:
         run: |
           npm run build
           npm test
+        env:
+          PI_TEST_MOCK_PLATFORM: win32
 
       - name: Publish to npm
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PI_TEST_MOCK_PLATFORM: win32
