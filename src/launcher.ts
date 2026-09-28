@@ -5,6 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { ProtocolErrorCode } from "./protocol.js";
 
@@ -63,6 +64,14 @@ export function findWindowsTerminal(): string | null {
   if (process.env.PI_TERMINAL_WORKER_WT_PATH && fs.existsSync(process.env.PI_TERMINAL_WORKER_WT_PATH)) {
     return process.env.PI_TERMINAL_WORKER_WT_PATH;
   }
+
+  // 1. 优先尝试直接在 PATH 中调用 wt.exe (WindowsApps 别名通常在 PATH 中可直接执行)
+  try {
+    const res = spawnSync("wt.exe", ["--version"], { shell: false });
+    if (!res.error && (res.status === 0 || res.status === null)) {
+      return "wt.exe";
+    }
+  } catch {}
 
   const localAppData = process.env.LOCALAPPDATA;
   if (localAppData) {
