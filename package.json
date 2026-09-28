@@ -27,7 +27,7 @@
   ],
   "pi": {
     "extensions": [
-      "./dist/extension.js"
+      "./src/extension.ts"
     ]
   },
   "scripts": {
