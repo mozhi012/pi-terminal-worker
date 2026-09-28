@@ -60,8 +60,9 @@ describe("Launcher and Descriptor Tests", () => {
     );
 
     // 不存在的目录
+    const nonExistentPath = path.resolve(process.cwd(), "non_existent_dir_12345678");
     assert.throws(
-      () => validateAndPrepareLaunch("C:\\non_existent_dir_12345678"),
+      () => validateAndPrepareLaunch(nonExistentPath),
       /指定的 cwd 不存在/,
     );
   });
