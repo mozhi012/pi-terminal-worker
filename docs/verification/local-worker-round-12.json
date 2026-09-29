@@ -1,0 +1,1 @@
+{"round": 12, "purpose": "post-restart-extension-path-acceptance", "extensionSource": "E:\\web\\ptw-installed", "strictTransport": true, "provider": "deepseek", "model": "deepseek-flash", "thinkingLevel": "high", "notes": "written by worker loaded from the installed package after Pi restart"}

@@ -465,3 +465,16 @@ tar -xzf E:/web/mozhi0012-pi-terminal-worker-0.1.0.tgz -C E:/web/ptw-installed -
 - **未 commit / 未 push**，保持未提交工作区现状。
 - 需要用户重启 Pi 后，由扩展正常路径（`E:\web\ptw-installed`）再跑一轮 `worker_start`：当前主 Pi 会话里加载的仍是改动前的扩展实例。
 
+### 6. 重启后的正常路径验收（round 12，RESULT: PASS）
+
+- 用户重启 Pi 后，`pi list` 确认当前扩展源为 `E:\web\ptw-installed`，其 `src/extension.ts`、`src/worker.ts`、`src/transport.ts` 与已提交的 `0ebe2d2` 逐字节一致。
+- 通过扩展正常路径（主控 `worker_start` 工具，生产入口 `STRICT_PROTOCOL=true`）启动真实 Windows Terminal + 真实 Worker，默认 `deepseek / deepseek-flash / high`。
+- 事件链：`child_spawned(pid 39720)` → `worker_ready` → `task_accepted` → `activity(busy: bash×3/write/bash)` → `report_candidate` → `report_committed`（`ready_for_review + connected + idle`）；`diagnostics` 全 0，`unknownDeliveries` 为空。
+- Worker 创建 `docs/verification/local-worker-round-12.json`（294 字节，单行，LF），主代理独立 `JSON.parse` 校验 `round=12`、`strictTransport=true`、`extensionSource="E:\\web\\ptw-installed"`、无 CR；`git status --short` 仅多出该一个文件，无其他改动。
+- `worker_close(accepted)` 成功，PID 39720 已退出、名额释放。**结论：严格协议模式在生产入口默认开启后，扩展正常路径完全可用。**
+
+### 7. 提交与推送
+
+- 上述三组功能 + 本轮严格模式收尾已作为一个提交落地：`0ebe2d2`（38 files, +9169/-495），并推送到 `origin/main`（`ae99de7..0ebe2d2`）。
+- 工作区仅保留 round-12 验收证据文件（见上节），其余全部已提交。
+
