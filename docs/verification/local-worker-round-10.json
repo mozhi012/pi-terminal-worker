@@ -1,0 +1,8 @@
+{
+  "round": 10,
+  "purpose": "packaged-artifact-acceptance",
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "thinkingLevel": "high",
+  "notes": "written by worker loaded from the packaged artifact"
+}

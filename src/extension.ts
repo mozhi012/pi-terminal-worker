@@ -8,23 +8,34 @@ import { ControllerManager } from "./controller.js";
 import { WorkerManager } from "./worker.js";
 import { updateWorkerUiStatus } from "./ui.js";
 
+// 生产入口固定开启严格协议校验 (入站 seq 严格递增 + Worker 任务身份校验)
+export const STRICT_PROTOCOL = true;
+
+export function createControllerManager(pi: ExtensionAPI): ControllerManager {
+  return new ControllerManager(pi, STRICT_PROTOCOL);
+}
+
+export function createWorkerManager(pi: ExtensionAPI): WorkerManager {
+  return new WorkerManager(pi, STRICT_PROTOCOL);
+}
+
 export default function (pi: ExtensionAPI): void {
   const role = process.env.PI_TERMINAL_WORKER_ROLE;
 
   if (role === "worker") {
     // 作为受控端 Worker 启动
-    const worker = new WorkerManager(pi);
+    const worker = createWorkerManager(pi);
     worker.init().catch((err) => {
       console.error("[pi-terminal-worker] Worker 初始化失败:", err);
     });
   } else {
     // 默认作为主控端 Controller 启动
-    const controller = new ControllerManager(pi);
+    const controller = createControllerManager(pi);
     controller.registerToolsAndCommands();
 
-    // 监听 session_start，更新 UI 状态栏
+    // 监听 session_start，结束上一会话资源并递增 generation，然后更新 UI 状态栏
     pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
-      controller.sessionGen.nextGeneration();
+      await controller.handleSessionStart();
       updateWorkerUiStatus(ctx.ui, controller.workerManager.getInstance());
     });
 

@@ -14,6 +14,7 @@
   "files": [
     "dist",
     "runtime",
+    "src",
     "README.md",
     "LICENSE"
   ],
@@ -34,6 +35,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "node --test test/**/*.test.ts",
+    "prepack": "npm run build",
     "prepublishOnly": "npm run build && npm test"
   },
   "repository": {

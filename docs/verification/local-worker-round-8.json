@@ -1,0 +1,8 @@
+{
+  "round": 8,
+  "purpose": "explicit-model-params-acceptance",
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "thinkingLevel": "low",
+  "notes": "written by worker launched with explicit model params"
+}

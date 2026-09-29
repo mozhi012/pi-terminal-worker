@@ -11,10 +11,12 @@ import { StringDecoder } from "node:string_decoder";
 function parseArgs() {
   const args = process.argv.slice(2);
   let descriptorB64 = null;
+  let title = null;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--descriptor" && i + 1 < args.length) {
       descriptorB64 = args[i + 1];
-      break;
+    } else if (args[i] === "--title" && i + 1 < args.length) {
+      title = args[i + 1];
     }
   }
   if (!descriptorB64) {
@@ -24,20 +26,65 @@ function parseArgs() {
 
   try {
     const json = Buffer.from(descriptorB64, "base64url").toString("utf8");
-    return JSON.parse(json);
+    return { descriptor: JSON.parse(json), title };
   } catch (err) {
     console.error("[bootstrap] 描述符解析失败:", err.message);
     process.exit(1);
   }
 }
 
-const descriptor = parseArgs();
+const parsed = parseArgs();
+const descriptor = parsed.descriptor;
 const { controllerId, workerId, pipePath, bootstrapToken } = descriptor;
+
+// PS/CMD 回退后端下由本进程设置新控制台窗口标题 (WT 后端用 --title，不受影响)
+if (process.platform === "win32" && parsed.title) {
+  try {
+    process.title = parsed.title;
+  } catch {}
+}
 
 let socket = null;
 let seq = 0;
 let childProcess = null;
 let isExiting = false;
+/** 是否已完成 hello_ok 认证；未认证前拒绝 launch/terminate */
+let authenticated = false;
+/** 是否已发起过 launch；用独立布尔避免 spawn 抛错后仍可重复启动 */
+let launchRequested = false;
+
+/** 接收缓冲上限：超过即停止累积并销毁连接 (2 MiB) */
+const MAX_RECV_BUFFER_BYTES = 2 * 1024 * 1024;
+
+function isNonEmptyString(value, maxLen) {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLen;
+}
+
+/**
+ * 严格校验 launch payload，返回 { ok: true } 或 { ok: false, field }。
+ * 缺失/类型错误/超长都视为校验失败。
+ */
+function validateLaunchPayload(payload) {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return { ok: false, field: "payload" };
+  }
+  for (const field of ["cwd", "nodePath", "piCliPath", "extensionPath", "workerPipePath"]) {
+    if (!isNonEmptyString(payload[field], 4096)) {
+      return { ok: false, field };
+    }
+  }
+  if (!isNonEmptyString(payload.workerToken, 512)) {
+    return { ok: false, field: "workerToken" };
+  }
+  for (const field of ["provider", "model", "thinkingLevel"]) {
+    const value = payload[field];
+    if (value === undefined || value === null) continue;
+    if (!isNonEmptyString(value, 512)) {
+      return { ok: false, field };
+    }
+  }
+  return { ok: true };
+}
 
 function sendEnvelope(type, payload, replyTo) {
   if (!socket || socket.destroyed) return;
@@ -77,7 +124,8 @@ function handleEnvelope(envelope) {
   const { id, type, payload } = envelope;
 
   if (type === "hello_ok") {
-    // 握手完成，等待 controller 发送 launch 指令
+    // 握手完成，标记已认证，等待 controller 发送 launch 指令
+    authenticated = true;
     return;
   }
 
@@ -87,10 +135,33 @@ function handleEnvelope(envelope) {
   }
 
   if (type === "launch") {
+    if (!authenticated) {
+      sendAck(id, false, "连接尚未完成认证", "AUTH_FAILED");
+      return;
+    }
+    if (launchRequested) {
+      sendAck(id, false, "已存在子进程，拒绝重复 launch", "ALREADY_EXISTS");
+      return;
+    }
+    const validation = validateLaunchPayload(payload);
+    if (!validation.ok) {
+      const message = `launch payload 校验失败: ${validation.field}`;
+      sendAck(id, false, message, "PROTOCOL_ERROR");
+      sendEnvelope("launch_failed", { error: message });
+      return;
+    }
+    // 先置位再 spawn：spawn 抛错后也不允许再次 launch，避免重复子进程歧义
+    launchRequested = true;
     try {
-      const { cwd, nodePath, piCliPath, workerToken, workerPipePath } = payload;
-      
-      childProcess = spawn(nodePath, [piCliPath], {
+      const { cwd, nodePath, piCliPath, extensionPath, workerToken, workerPipePath, provider, model, thinkingLevel } = payload;
+
+      // 可选模型参数：不传时保持 Pi 默认设置，不硬编码任何模型
+      const cliArgs = [piCliPath, "--no-extensions", "-e", extensionPath];
+      if (provider) cliArgs.push("--provider", String(provider));
+      if (model) cliArgs.push("--model", String(model));
+      if (thinkingLevel) cliArgs.push("--thinking", String(thinkingLevel));
+
+      childProcess = spawn(nodePath, cliArgs, {
         cwd,
         stdio: "inherit",
         shell: false,
@@ -136,6 +207,10 @@ function handleEnvelope(envelope) {
   }
 
   if (type === "terminate") {
+    if (!authenticated) {
+      sendAck(id, false, "连接尚未完成认证", "AUTH_FAILED");
+      return;
+    }
     sendAck(id, true);
     terminateChild(payload && payload.force);
     return;
@@ -164,6 +239,17 @@ function connectToController() {
 
   socket.on("data", (chunk) => {
     buffer += decoder.write(chunk);
+    if (Buffer.byteLength(buffer, "utf8") > MAX_RECV_BUFFER_BYTES) {
+      console.error("[bootstrap] 错误: 接收缓冲超过 2 MiB 上限，停止累积并销毁连接");
+      try {
+        socket.destroy();
+      } catch {}
+      if (!childProcess) {
+        // 无子进程时留着一个没有通信对象的窗口没有意义
+        process.exit(1);
+      }
+      return;
+    }
     let idx;
     while ((idx = buffer.indexOf("\n")) !== -1) {
       const line = buffer.slice(0, idx).trim();

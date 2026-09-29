@@ -38,6 +38,7 @@ export interface WorkerInstanceMetadata {
   cwd: string;
   title: string;
   childPid?: number;
+  provider?: string;
   modelId?: string;
   thinkingLevel?: string;
   tools?: string[];
@@ -102,31 +103,36 @@ export class SingleWorkerManager {
       throw new Error(`当前正在处理其他状态转换，请稍候重试`);
     }
 
-    if (this.hasActiveInstance()) {
-      const cur = this.currentInstance!;
-      throw new Error(
-        `[${ProtocolErrorCode.ALREADY_EXISTS}] 当前已存在运行中或未确认退出的 Worker (ID: ${cur.workerId}, 状态: ${cur.lifecycleState})。单主控同一时间仅允许一个执行端。`,
-      );
+    this.mutexLocked = true;
+    try {
+      if (this.hasActiveInstance()) {
+        const cur = this.currentInstance!;
+        throw new Error(
+          `[${ProtocolErrorCode.ALREADY_EXISTS}] 当前已存在运行中或未确认退出的 Worker (ID: ${cur.workerId}, 状态: ${cur.lifecycleState})。单主控同一时间仅允许一个执行端。`,
+        );
+      }
+
+      const now = Date.now();
+      const instance: WorkerInstanceMetadata = {
+        controllerId,
+        workerId,
+        taskId,
+        cwd,
+        title,
+        revision: 1,
+        runId: 1,
+        lifecycleState: "launching",
+        taskState: "created",
+        activityState: "unknown",
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      this.currentInstance = instance;
+      return { ...this.currentInstance };
+    } finally {
+      this.mutexLocked = false;
     }
-
-    const now = Date.now();
-    const instance: WorkerInstanceMetadata = {
-      controllerId,
-      workerId,
-      taskId,
-      cwd,
-      title,
-      revision: 1,
-      runId: 1,
-      lifecycleState: "launching",
-      taskState: "created",
-      activityState: "unknown",
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    this.currentInstance = instance;
-    return { ...this.currentInstance };
   }
 
   /**
@@ -166,12 +172,18 @@ export class SingleWorkerManager {
   }
 
   /**
-   * 更新模型信息
+   * 更新模型信息 (worker_ready 初始上报或 model_changed 刷新)
    */
-  public setModelInfo(modelId?: string, thinkingLevel?: string, tools?: string[]): void {
+  public setModelInfo(
+    provider?: string,
+    modelId?: string,
+    thinkingLevel?: string,
+    tools?: string[],
+  ): void {
     if (!this.currentInstance) return;
-    this.currentInstance.modelId = modelId;
-    this.currentInstance.thinkingLevel = thinkingLevel;
+    if (provider !== undefined) this.currentInstance.provider = provider;
+    if (modelId !== undefined) this.currentInstance.modelId = modelId;
+    if (thinkingLevel !== undefined) this.currentInstance.thinkingLevel = thinkingLevel;
     if (tools) this.currentInstance.tools = [...tools];
     this.currentInstance.updatedAt = Date.now();
   }
@@ -229,6 +241,11 @@ export class CleanupRegistry {
   private disposers = new Set<() => Promise<void> | void>();
   private isDisposed = false;
 
+  /** 当前待执行的 disposer 数量 (诊断/测试用) */
+  public get size(): number {
+    return this.disposers.size;
+  }
+
   public register(disposer: () => Promise<void> | void): () => void {
     this.disposers.add(disposer);
     return () => {
@@ -236,6 +253,10 @@ export class CleanupRegistry {
     };
   }
 
+  /**
+   * 执行并清空全部 disposer，同一轮只执行一次。
+   * 重复调用直接返回，既不重复执行 disposer 也不抛错。
+   */
   public async disposeAll(): Promise<void> {
     if (this.isDisposed) return;
     this.isDisposed = true;
@@ -248,5 +269,13 @@ export class CleanupRegistry {
       }
     }
     this.disposers.clear();
+  }
+
+  /**
+   * 复位 dispose 标记，使同一个 registry 实例可被下一次会话复用。
+   * disposers 已在 disposeAll 中清空，因此 reset 后可重新 register 并再次 disposeAll。
+   */
+  public reset(): void {
+    this.isDisposed = false;
   }
 }

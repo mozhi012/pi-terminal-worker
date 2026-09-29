@@ -64,7 +64,7 @@ export class FakePiContext implements ExtensionContext {
 
   // 其他 context 占位实现
   public sessionManager = {} as any;
-  public model = {} as any;
+  public model = { provider: "fake-provider", id: "fake-model-1", name: "Fake Model" } as any;
   public getContextUsage = () => undefined;
   public compact = async () => {};
 }
@@ -74,11 +74,22 @@ export class FakePiAPI implements Partial<ExtensionAPI> {
   public commands = new Map<string, any>();
   public events = new EventEmitter() as any;
   private eventHandlers = new Map<string, Set<Function>>();
+  private activeTools: string[] | null = null;
 
   public sentUserMessages: Array<{
     content: string;
     options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean };
   }> = [];
+
+  public thinkingLevel: string = "medium";
+
+  public getThinkingLevel(): string {
+    return this.thinkingLevel;
+  }
+
+  public setThinkingLevel(level: string): void {
+    this.thinkingLevel = level;
+  }
 
   public registerTool(tool: ToolDefinition): void {
     this.tools.set(tool.name, tool);
@@ -89,7 +100,11 @@ export class FakePiAPI implements Partial<ExtensionAPI> {
   }
 
   public getActiveTools(): string[] {
-    return Array.from(this.tools.keys());
+    return this.activeTools ?? Array.from(this.tools.keys());
+  }
+
+  public setActiveTools(names: string[]): void {
+    this.activeTools = [...names];
   }
 
   public sendUserMessage(content: any, options?: any): void {
@@ -109,8 +124,10 @@ export class FakePiAPI implements Partial<ExtensionAPI> {
   public async emitPiEvent(event: string, payload: any, ctx: ExtensionContext): Promise<any> {
     const handlers = this.eventHandlers.get(event);
     if (!handlers) return;
+    let result;
     for (const h of handlers) {
-      await h(payload, ctx);
+      result = await h(payload, ctx);
     }
+    return result;
   }
 }
