@@ -1020,7 +1020,8 @@ describe("2B: Controller 连接接受与身份校验", () => {
       assert.strictEqual(ack2.payload.code, "ALREADY_EXISTS");
 
       await h.waitFrame((f) => f.type === "child_spawned", "child_spawned");
-      await h.waitFrame((f) => f.type === "child_exit", "child_exit");
+      const childExit = await h.waitFrame((f) => f.type === "child_exit", "child_exit");
+      assert.strictEqual(childExit.payload.code, 0, "Worker CLI extension arguments must pass fixture checks");
       await waitChildExit(h.proc, 4000);
 
       assert.strictEqual(

@@ -156,7 +156,8 @@ function handleEnvelope(envelope) {
       const { cwd, nodePath, piCliPath, extensionPath, workerToken, workerPipePath, provider, model, thinkingLevel } = payload;
 
       // 可选模型参数：不传时保持 Pi 默认设置，不硬编码任何模型
-      const cliArgs = [piCliPath, "--no-extensions", "-e", extensionPath];
+      // 正常加载用户、项目与内置扩展，同时确保 Worker 通信扩展可用。
+      const cliArgs = [piCliPath, "-e", extensionPath];
       if (provider) cliArgs.push("--provider", String(provider));
       if (model) cliArgs.push("--model", String(model));
       if (thinkingLevel) cliArgs.push("--thinking", String(thinkingLevel));

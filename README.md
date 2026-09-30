@@ -6,6 +6,7 @@
 
 - **多 Worker 并发**：主代理可按需多次调用 `worker_start`，同一主 Pi 会话同时监督多个独立窗口中的 Worker；每个 Worker 拥有独立的窗口/进程、命名管道、两条连接、token、收件箱、报告缓存、心跳与关闭流程，互不串线。一个 Worker 失败、超时、断连或退出不影响其他 Worker。
 - **独立终端交互**：优先用 `wt.exe` 启动独立交互窗口；WT 缺失时自动回退 PowerShell (EncodedCommand 新控制台)，再回退 `cmd.exe /d /v:off`；均缺失时明确报错失败，不写任何临时任务文件。
+- **正常扩展加载**：Worker 按 Pi 默认规则加载用户、项目与内置扩展，并显式加载本扩展以建立通信；不复制主会话临时传入的其他 `-e` 参数，项目扩展仍受 Pi 信任规则约束。
 - **纯内存管道通讯**：通过 Windows 原生命名管道（`\\.\pipe\...`）实现双向 JSONL 通信，不在磁盘生成任何临时任务文件（不写 `pi-tasks/`、`task.md`、`result.md`）。
 - **默认模型可配置**：Worker 默认使用 `deepseek` / `deepseek-flash` / `thinking=high`（`worker_start` 未显式传参时生效）；可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `PI_TERMINAL_WORKER_DEFAULT_MODEL` / `PI_TERMINAL_WORKER_DEFAULT_THINKING` 覆盖。只影响新拉起的 Worker，不改动全局 Pi 设置、也不影响主 Pi 会话自身模型。
 - **模型状态实时上报**：Worker 在 `worker_ready` 上报实际 provider/modelId/thinkingLevel；会话内 `/model`、`/thinking` 切换后自动刷新主控端状态。
