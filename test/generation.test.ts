@@ -1,11 +1,19 @@
 import { describe, it } from "node:test";
 import * as assert from "node:assert";
 import { EventEmitter } from "node:events";
+import * as net from "node:net";
 import { ControllerManager } from "../dist/controller.js";
 import { CleanupRegistry } from "../dist/lifecycle.js";
 import { ProtocolErrorCode } from "../dist/protocol.js";
-import { AckTimeoutError } from "../dist/transport.js";
+import { AckTimeoutError, getPipePath } from "../dist/transport.js";
 import { FakePiAPI } from "./fake-pi.ts";
+
+/** 固定终端探测，避免测试依赖真实 where 探测 */
+const START_PROBES = {
+  findWt: () => "wt.exe" as string | null,
+  findPowershell: () => null as string | null,
+  findCmd: () => null as string | null,
+};
 
 /**
  * 轻量假管道 Socket：实现 JsonlConnection 所需的最小接口。
@@ -539,6 +547,196 @@ describe("第三组第一半：session generation 与幂等清理", () => {
     assert.strictEqual(releaseCount, 1, "releaseSlot 只能调用一次");
     assert.strictEqual(workerSock.framesOfType("close").length, 1, "close 只发送一次");
     assert.strictEqual(ctrl.workerManager.hasActiveInstance(), false);
+    await cleanup(ctrl);
+  });
+});
+
+describe("启动代际防护：start 在会话切换/释放后不得继续或改写状态", () => {
+  function makeStartController(suffix: string): { ctrl: ControllerManager; ids: any } {
+    const ctrl = new ControllerManager(new FakePiAPI() as any);
+    ctrl.launchSpawner = (() => new EventEmitter() as any) as any;
+    ctrl.launchTimeoutMs = 30000;
+    const ids = {
+      controllerId: `ctrl-${suffix}`,
+      workerId: `worker-${suffix}`,
+      taskId: `task-${suffix}`,
+    };
+    return { ctrl, ids };
+  }
+
+  it("startServer listen 晚于会话切换：关闭局部 srv、不注册 stale server，start 快速失败", async () => {
+    const { ctrl, ids } = makeStartController("gen1");
+    const settled = ctrl
+      .handleWorkerStart({ cwd: process.cwd(), title: "T", task: "干活" }, START_PROBES as any, {
+        ids,
+      })
+      .then(
+        () => "resolved",
+        (e) => (e as Error).message,
+      );
+
+    // 立即切换会话：startServer 的 listen 回调必然看到过期 gen
+    await ctrl.handleSessionStart();
+
+    const outcome = await settled;
+    assert.notStrictEqual(outcome, "resolved", "过期 gen 下 start 不得成功");
+    assert.match(String(outcome), /取消|会话已切换/);
+    assert.strictEqual((ctrl as any).server, null, "stale server 不得注册到 this.server");
+    assert.strictEqual((ctrl as any).pipePath, null, "stale pipePath 不得残留");
+    assert.strictEqual(
+      ctrl.workerManager.getInstance()?.lifecycleState,
+      "disconnected",
+      "stale catch 不得改写为 launch_unknown",
+    );
+    await cleanup(ctrl);
+  });
+
+  it("握手等待中切换会话：快速取消且不写 launch_unknown", async () => {
+    const { ctrl, ids } = makeStartController("gen2");
+    const settled = ctrl
+      .handleWorkerStart({ cwd: process.cwd(), title: "T", task: "干活" }, START_PROBES as any, {
+        ids,
+      })
+      .then(
+        () => "resolved",
+        (e) => (e as Error).message,
+      );
+
+    await waitFor(() => (ctrl as any).server !== null);
+    await settle(30); // 进入 waitForSupervisor 等待
+
+    await ctrl.handleSessionStart();
+    const outcome = await settled;
+    assert.notStrictEqual(outcome, "resolved");
+    assert.match(String(outcome), /取消|会话已切换/);
+    assert.notStrictEqual(
+      ctrl.workerManager.getInstance()?.lifecycleState,
+      "launch_unknown",
+      "会话切换后的失败不得写 launch_unknown",
+    );
+    await cleanup(ctrl);
+  });
+
+  it("dispose 后晚到的 startServer listen 不得复活 server/cleanup 句柄", async () => {
+    const { ctrl, ids } = makeStartController("gen3");
+    const settled = ctrl
+      .handleWorkerStart({ cwd: process.cwd(), title: "T", task: "干活" }, START_PROBES as any, {
+        ids,
+      })
+      .then(
+        () => "resolved",
+        () => "rejected",
+      );
+
+    await ctrl.dispose();
+    assert.strictEqual(await settled, "rejected", "dispose 后的在途 start 必须失败");
+    assert.strictEqual((ctrl as any).server, null, "dispose 后不得有存活的 server 引用");
+    assert.strictEqual((ctrl as any).cleanupRegistry.size, 0, "dispose 后不得留下清理器");
+    await cleanup(ctrl); // 幂等
+  });
+
+  it("会话切换后 listen error 竞态：stale 也必须 reject，不能永久挂起", async () => {
+    const controllerId = "ctrl-listen-err";
+    const pipePath = getPipePath(controllerId);
+    const blocker = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once("error", reject);
+      blocker.listen(pipePath, () => resolve());
+    });
+
+    try {
+      const ctrl = new ControllerManager(new FakePiAPI() as any);
+      ctrl.launchSpawner = (() => new EventEmitter() as any) as any;
+      ctrl.launchTimeoutMs = 30000;
+      const settled = ctrl
+        .handleWorkerStart({ cwd: process.cwd(), title: "T", task: "干活" }, START_PROBES as any, {
+          ids: { controllerId, workerId: "worker-listen-err", taskId: "task-listen-err" },
+        })
+        .then(
+          () => "resolved",
+          (e) => (e as Error).message,
+        );
+
+      // 先让代际失效，保证 listen 的 EADDRINUSE error 回调在 stale 状态下触发
+      await ctrl.handleSessionStart();
+
+      const outcome = await Promise.race([
+        settled,
+        new Promise((r) => setTimeout(() => r("__timeout__"), 2000)),
+      ]);
+      assert.notStrictEqual(outcome, "__timeout__", "stale listen error 必须 reject 本次 Promise");
+      assert.match(String(outcome), /命名管道监听失败|取消/);
+      assert.strictEqual((ctrl as any).server, null, "监听失败不得留下 server 引用");
+      await cleanup(ctrl);
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it("旧会话 task ACK 超时不得写入新会话 unknownDeliveries", async () => {
+    const ctrl = new ControllerManager(new FakePiAPI() as any);
+    ctrl.launchSpawner = (() => new EventEmitter() as any) as any;
+    ctrl.launchTimeoutMs = 30000;
+    const settled = ctrl
+      .handleWorkerStart({ cwd: process.cwd(), title: "T", task: "干活" }, START_PROBES as any, {
+        ids: { controllerId: IDS.controllerId, workerId: IDS.workerId, taskId: "task-1" },
+        bootstrapToken: "boot-token",
+        workerToken: "worker-token",
+      })
+      .then(
+        () => "resolved",
+        (e) => (e as Error).message,
+      );
+
+    await waitFor(() => (ctrl as any).server !== null);
+    const supSock = connectAndAuth(ctrl, "supervisor", "boot-token");
+    // 让 supervisor 自动回 launch ACK，否则初始任务永远不会开始
+    supSock.autoAckTypes = new Set(["launch"]);
+    await waitFor(() => (ctrl as any).supervisorConn);
+    const workerSock = connectAndAuth(ctrl, "worker", "worker-token");
+    await waitFor(() => (ctrl as any).workerConn);
+
+    // 拦截初始 task 的 ACK：让它在本会话失效后才 reject
+    let rejectTask!: (e: unknown) => void;
+    let taskPending = false;
+    const workerConn = (ctrl as any).workerConn;
+    workerConn.sendRequest = (env: any) => {
+      if (env?.type === "task") {
+        taskPending = true;
+        return new Promise((_resolve, reject) => {
+          rejectTask = reject;
+        });
+      }
+      return Promise.resolve({ ok: true, id: env?.id });
+    };
+
+    feed(workerSock, {
+      version: 1,
+      controllerId: IDS.controllerId,
+      workerId: IDS.workerId,
+      id: "ready-1",
+      seq: 2,
+      type: "worker_ready",
+      payload: { cwd: process.cwd(), tools: [], version: "1" },
+    });
+    await waitFor(() => taskPending && (ctrl as any).workerReadyReceived === true);
+
+    // 会话切换（会清空 unknownDeliveries），然后旧 task ACK 才超时失败
+    await ctrl.handleSessionStart();
+    assert.strictEqual((ctrl as any).unknownDeliveries.length, 0, "切换时已清空未知投递");
+    rejectTask(new AckTimeoutError("req-stale", 50));
+
+    const outcome = await settled;
+    assert.notStrictEqual(outcome, "resolved");
+    assert.strictEqual(
+      (ctrl as any).unknownDeliveries.length,
+      0,
+      "旧会话 task ACK 超时不得污染新会话 unknownDeliveries",
+    );
+    assert.strictEqual((ctrl as any).unknownDeliveriesDropped, 0);
+
+    supSock.destroy();
+    workerSock.destroy();
     await cleanup(ctrl);
   });
 });

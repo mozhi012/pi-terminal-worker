@@ -188,6 +188,36 @@ describe("Controller and Single Worker Mutex Tests", () => {
     assert.strictEqual(ctrl.workerManager.getInstance()?.lifecycleState, "closing");
   });
 
+  it("同一 Worker 并发 close：同 disposition 复用 in-flight，不同 disposition 拒绝", async () => {
+    const ctrl = new ControllerManager(new FakePiAPI() as any);
+    ctrl.closeWaitTimeoutMs = 300;
+    ctrl.workerManager.acquireLaunchSlot("ctrl-1", "worker-1", "task-1", process.cwd(), "Title");
+    ctrl.workerManager.updateLifecycleState("connected");
+    let closeSends = 0;
+    (ctrl as any).workerConn = {
+      socket: { destroyed: false },
+      nextSeq: 1,
+      sendRequest: async () => {
+        closeSends += 1;
+        return { ok: true };
+      },
+    };
+
+    const p1 = ctrl.handleWorkerClose({ workerId: "worker-1", disposition: "abandoned" });
+    const p2 = ctrl.handleWorkerClose({ workerId: "worker-1", disposition: "abandoned" });
+    await assert.rejects(
+      () => ctrl.handleWorkerClose({ workerId: "worker-1", disposition: "accepted" }),
+      new RegExp(ProtocolErrorCode.INVALID_STATE),
+    );
+
+    setTimeout(() => ctrl.workerManager.updateLifecycleState("closed"), 20);
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.strictEqual(r1.ok, true);
+    assert.strictEqual(r2.ok, true);
+    assert.strictEqual(closeSends, 1, "并发同 disposition 只发送一次 close 指令");
+    assert.strictEqual(ctrl.workerManager.hasActiveInstance(), false);
+  });
+
   it("followup 送达未知时旧回执不可验收", async () => {
     const ctrl = new ControllerManager(new FakePiAPI() as any);
     ctrl.workerManager.acquireLaunchSlot("ctrl-1", "worker-1", "task-1", process.cwd(), "Title");

@@ -1,5 +1,7 @@
 # pi-terminal-worker：独立终端子代理扩展设计与实施方案
 
+> **历史设计文档（部分已被覆盖）**：本文记录的是最初的单实例设计与实施方案（第 5 条“单个主控会话最多拥有一个执行实例”等限制）。多 Worker 并发支持以 [`docs/multi-worker-concurrency-plan.md`](./multi-worker-concurrency-plan.md) 为准：详见其中的目标/非目标、`MultiWorkerCoordinator` 架构、状态与资源所有权、对外接口及分阶段验收。本文保留为历史背景，不再逐条维护，也不再作为并发行为的依据。
+
 > 状态：待评审，尚未实现或完成端到端验证。
 > 基线：本机 Pi `0.87.1` 的文档、类型声明与扩展示例。
 > 暂定名称：`pi-terminal-worker`，不覆盖或修改第三方 `pi-subagent` 源码。

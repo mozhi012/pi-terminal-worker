@@ -431,6 +431,16 @@ export class ControllerManager {
     return this.sessionGen.isValid(gen);
   }
 
+  /**
+   * 启动流程的代际校验：handleWorkerStart 在任一 await 之后都必须用最初捕获的 gen 复核。
+   * 会话切换或 dispose 后抛出，调用方不得继续 spawn、注册连接或改写状态。
+   */
+  private assertStartActive(startGen: number): void {
+    if (this.isDisposed || !this.isCurrentGeneration(startGen)) {
+      throw new Error("会话已切换或控制器已释放，启动流程已取消");
+    }
+  }
+
   /** 结束全部等待者 (dispose 与会话切换共用)，区分错误文案由调用方传入 */
   private rejectWaiters(err: Error): void {
     const waiters = this.waiters;
@@ -784,6 +794,10 @@ export class ControllerManager {
    * 启动管道服务端并等待连接
    */
   public async startServer(controllerId: string): Promise<string> {
+    // 捕获本次监听的会话代际；listen 回调可能晚于会话切换/释放。
+    const gen = this.activeGeneration;
+    const pipePath = getPipePath(controllerId);
+
     if (this.server) {
       try {
         this.server.close();
@@ -795,22 +809,39 @@ export class ControllerManager {
       this.serverCleanup = null;
     }
 
-    this.pipePath = getPipePath(controllerId);
+    this.pipePath = pipePath;
 
     return new Promise<string>((resolve, reject) => {
       const srv = net.createServer((socket) => {
+        // 旧 srv 在会话切换后可能仍投递 socket：按 gen 拒绝，不只依赖 isDisposed
+        if (this.isDisposed || !this.isCurrentGeneration(gen)) {
+          try {
+            socket.destroy();
+          } catch {
+            // 忽略销毁时的错误
+          }
+          return;
+        }
         this.handleIncomingSocket(socket);
       });
 
       srv.on("error", (err) => {
-        reject(
-          new Error(
-            `命名管道监听失败 (${this.pipePath}): ${err.message}`,
-          ),
-        );
+        // 无论 stale/current 都必须 reject 本次 Promise：listen 失败不会再触发 listen 回调，
+        // 否则 await startServer 永久挂起；stale 只是不再改写共享字段。
+        reject(new Error(`命名管道监听失败 (${pipePath}): ${err.message}`));
       });
 
-      srv.listen(this.pipePath, () => {
+      srv.listen(pipePath, () => {
+        // listen 可能晚于会话切换/释放：关闭局部 srv，绝不注册回已清理的 registry
+        if (this.isDisposed || !this.isCurrentGeneration(gen)) {
+          try {
+            srv.close();
+          } catch {
+            // 忽略关闭时的错误
+          }
+          reject(new Error("会话已切换或控制器已释放，命名管道监听已取消"));
+          return;
+        }
         this.server = srv;
         if (this.serverCleanup) this.serverCleanup();
         this.serverCleanup = this.cleanupRegistry.register(() => {
@@ -821,7 +852,7 @@ export class ControllerManager {
           }
           if (this.server === srv) this.server = null;
         });
-        resolve(this.pipePath!);
+        resolve(pipePath);
       });
     });
   }
@@ -831,6 +862,15 @@ export class ControllerManager {
    * 认证成功后绑定并回 hello_ok；任何失败路径统一走 rejectIncomingSocket。
    */
   private handleIncomingSocket(socket: net.Socket): void {
+    // 控制器已释放：拒绝并销毁晚到的连接，不得创建认证定时器/绑定清理器
+    if (this.isDisposed) {
+      try {
+        socket.destroy();
+      } catch {
+        // 忽略销毁时的错误
+      }
+      return;
+    }
     let authenticated = false;
     let authTimer: NodeJS.Timeout | null = setTimeout(() => {
       authTimer = null;
@@ -1508,6 +1548,9 @@ export class ControllerManager {
     revision: number;
     message: string;
   }> {
+    // 在 start 一开始锁定会话代际：后续每个 await 阶段都必须以该 gen 复核，
+    // 避免会话切换/释放后仍 spawn、注册连接或改写新会话状态。
+    const startGen = this.activeGeneration;
     if (jsonByteLength({
       task: params.task,
       context: params.context,
@@ -1556,6 +1599,7 @@ export class ControllerManager {
     try {
       // 启动管道服务
       const pipePath = await this.startServer(controllerId);
+      this.assertStartActive(startGen);
 
       const desc: WorkerDescriptor = {
         version: PROTOCOL_VERSION,
@@ -1571,6 +1615,7 @@ export class ControllerManager {
       const terminalBackends = detectTerminalBackends(probes);
       let launchedBackend = spec.backend;
       let launchError: unknown = null;
+      this.assertStartActive(startGen);
       let child = launchWorkerWindow(spec, { spawnFn: this.launchSpawner ?? undefined });
 
       // 仅在 spawn 明确失败时回退。握手超时不是安全的回退信号，避免重复开窗。
@@ -1601,6 +1646,9 @@ export class ControllerManager {
         }
       }
 
+      // spawn 之后、发送 launch 之前再次复核代际
+      this.assertStartActive(startGen);
+
       // 发送 launch 指令 (可选模型参数不传时保持 Pi 默认设置)
       const launchPayload: LaunchPayload = {
         cwd: env.cwd,
@@ -1623,9 +1671,11 @@ export class ControllerManager {
         type: "launch",
         payload: launchPayload,
       });
+      this.assertStartActive(startGen);
 
       // 等待 worker 连接与 ready
-      await this.waitForWorkerReady(launchTimeoutMs);
+      await this.waitForWorkerReady(launchTimeoutMs, startGen);
+      this.assertStartActive(startGen);
 
       // 发送初始任务
       const taskPayload: TaskPayload = {
@@ -1653,6 +1703,10 @@ export class ControllerManager {
           payload: taskPayload,
         });
       } catch (err: unknown) {
+        // 会话已切换/已释放：ACK 晚到失败不得污染新会话的 unknownDeliveries
+        if (this.isDisposed || !this.isCurrentGeneration(startGen)) {
+          throw err;
+        }
         if (isDeliveryUnknownError(err)) {
           // ACK 超时 = 投递结果未知：任务可能已被 Worker 接收并执行。
           // 不释放名额、不降级 lifecycle（连接仍存活，保持 connected），仅登记并明确上报。
@@ -1678,6 +1732,7 @@ export class ControllerManager {
         throw new Error(`Worker 拒绝接收任务: ${ack.error || "未知原因"}`);
       }
 
+      this.assertStartActive(startGen);
       this.workerManager.updateTaskState("running");
       this.appendInbox("task_accepted", taskPayload, taskId, 1, 1);
 
@@ -1691,6 +1746,10 @@ export class ControllerManager {
           "无需循环 worker_wait；如需诊断或同步确认再显式调用 worker_wait。",
       };
     } catch (err: unknown) {
+      // 会话已切换/已释放：绝不改写生命周期、绝不复活资源；保留占位由会话/释放流程处理
+      if (this.isDisposed || !this.isCurrentGeneration(startGen)) {
+        throw err;
+      }
       const inst = this.workerManager.getInstance();
       if (inst?.lifecycleState === "closed") {
         // 「进程已确认退出」优先级高于「投递未知」：Supervisor 已明确上报
@@ -1729,8 +1788,8 @@ export class ControllerManager {
     timeoutMs: number,
     backend: string,
     child?: ChildProcess,
+    gen: number = this.activeGeneration,
   ): Promise<void> {
-    const gen = this.activeGeneration;
     const start = Date.now();
     let spawnError: TerminalSpawnError | null = null;
     const onError = (err: Error) => {
@@ -1739,7 +1798,7 @@ export class ControllerManager {
     child?.once?.("error", onError);
 
     while (Date.now() - start < timeoutMs) {
-      if (!this.isCurrentGeneration(gen)) {
+      if (this.isDisposed || !this.isCurrentGeneration(gen)) {
         throw new Error("会话已切换，等待 Supervisor 握手已取消");
       }
       if (this.supervisorConn) return;
@@ -1758,11 +1817,13 @@ export class ControllerManager {
    * worker_ready 在 Worker 的 session_start 时发出，收到它才能保证 currentContext 已就绪，
    * 避免初始任务先于会话启动而永久卡在内部队列。
    */
-  private async waitForWorkerReady(timeoutMs: number): Promise<void> {
-    const gen = this.activeGeneration;
+  private async waitForWorkerReady(
+    timeoutMs: number,
+    gen: number = this.activeGeneration,
+  ): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (!this.isCurrentGeneration(gen)) {
+      if (this.isDisposed || !this.isCurrentGeneration(gen)) {
         throw new Error("会话已切换，等待 Worker worker_ready 已取消");
       }
       if (this.workerReadyReceived && this.workerConn) return;
