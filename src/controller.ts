@@ -238,8 +238,8 @@ class TerminalSpawnError extends Error {
  * 只影响新拉起的 Worker，不影响主 Pi 会话自身的默认模型，也不改动全局 Pi 设置。
  * 可用环境变量覆盖：PI_TERMINAL_WORKER_DEFAULT_PROVIDER / _DEFAULT_MODEL / _DEFAULT_THINKING
  */
-export const DEFAULT_WORKER_PROVIDER = "deepseek";
-export const DEFAULT_WORKER_MODEL = "deepseek-flash";
+export const DEFAULT_WORKER_PROVIDER = "antigravity";
+export const DEFAULT_WORKER_MODEL = "gemini-3.8-flash";
 export const DEFAULT_WORKER_THINKING_LEVEL = "high";
 
 export interface WorkerModelDefaults {
@@ -1562,7 +1562,7 @@ export class ControllerManager {
 
     const env = validateAndPrepareLaunch(params.cwd, probes);
 
-    // 未显式指定时使用 Worker 默认模型配置 (deepseek/deepseek-flash/high，可由环境变量覆盖)
+    // 未显式指定时使用 Worker 默认模型配置 (antigravity/gemini-3.8-flash/high，可由环境变量覆盖)
     const modelParams = resolveWorkerModelParams(params);
 
     // internal 仅用于测试注入确定性 id/token/超时，不改变默认对外行为

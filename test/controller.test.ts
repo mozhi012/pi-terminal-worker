@@ -529,10 +529,10 @@ describe("Controller and Single Worker Mutex Tests", () => {
 });
 
 describe("Worker (子代理) 默认模型配置", () => {
-  it("未显式指定时默认 deepseek / deepseek-flash / high", () => {
+  it("未显式指定时默认 antigravity / gemini-3.8-flash / high", () => {
     assert.deepStrictEqual(resolveWorkerModelDefaults({}), {
-      provider: "deepseek",
-      model: "deepseek-flash",
+      provider: "antigravity",
+      model: "gemini-3.8-flash",
       thinkingLevel: "high",
     });
   });
@@ -550,19 +550,19 @@ describe("Worker (子代理) 默认模型配置", () => {
     // 显式参数覆盖默认配置
     assert.deepStrictEqual(
       resolveWorkerModelParams({ model: "other-model", thinkingLevel: "medium" }),
-      { provider: "deepseek", model: "other-model", thinkingLevel: "medium" },
+      { provider: "antigravity", model: "other-model", thinkingLevel: "medium" },
     );
     // 空白字符串视为未指定，回落到默认值
     assert.deepStrictEqual(resolveWorkerModelParams({ provider: "  ", model: "  " }), {
-      provider: "deepseek",
-      model: "deepseek-flash",
+      provider: "antigravity",
+      model: "gemini-3.8-flash",
       thinkingLevel: "high",
     });
     // 显式值两侧空白会被裁剪
     assert.deepStrictEqual(
       resolveWorkerModelParams(
         { provider: " local ", model: " Qwen3.8-27B " },
-        { provider: "deepseek", model: "deepseek-flash", thinkingLevel: "high" },
+        { provider: "antigravity", model: "gemini-3.8-flash", thinkingLevel: "high" },
       ),
       { provider: "local", model: "Qwen3.8-27B", thinkingLevel: "high" },
     );

@@ -8,7 +8,7 @@
 - **独立终端交互**：优先用 `wt.exe` 启动独立交互窗口；WT 缺失时自动回退 PowerShell (EncodedCommand 新控制台)，再回退 `cmd.exe /d /v:off`；均缺失时明确报错失败，不写任何临时任务文件。
 - **正常扩展加载**：Worker 按 Pi 默认规则加载用户、项目与内置扩展，并显式加载本扩展以建立通信；不复制主会话临时传入的其他 `-e` 参数，项目扩展仍受 Pi 信任规则约束。
 - **纯内存管道通讯**：通过 Windows 原生命名管道（`\\.\pipe\...`）实现双向 JSONL 通信，不在磁盘生成任何临时任务文件（不写 `pi-tasks/`、`task.md`、`result.md`）。
-- **默认模型可配置**：Worker 默认使用 `deepseek` / `deepseek-flash` / `thinking=high`（`worker_start` 未显式传参时生效）；可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `PI_TERMINAL_WORKER_DEFAULT_MODEL` / `PI_TERMINAL_WORKER_DEFAULT_THINKING` 覆盖。只影响新拉起的 Worker，不改动全局 Pi 设置、也不影响主 Pi 会话自身模型。
+- **默认模型可配置**：Worker 默认使用 `antigravity` / `gemini-3.8-flash` / `thinking=high`（`worker_start` 未显式传参时生效）；可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `PI_TERMINAL_WORKER_DEFAULT_MODEL` / `PI_TERMINAL_WORKER_DEFAULT_THINKING` 覆盖。只影响新拉起的 Worker，不改动全局 Pi 设置、也不影响主 Pi 会话自身模型。
 - **模型状态实时上报**：Worker 在 `worker_ready` 上报实际 provider/modelId/thinkingLevel；会话内 `/model`、`/thinking` 切换后自动刷新主控端状态。
 - **状态三维分离**：严格区分生命周期（`launching/connected/closed` 等）、任务状态（`created/running/ready_for_review/accepted` 等）与 Pi 活动状态（`idle/busy`）。
 - **健全的回执与验收闭环**：候选回执在稳定边界确认；存在未解决问题或测试失败时严格拒绝验收。
@@ -52,7 +52,7 @@ Worker 侧握手时序防护：`worker_ready` 必须等 `hello_ok` 认证确认�
   - `provider`：限定 `--model` 查找的 provider（需与 `model` 配合）；
   - `model`：模型 ID 或模糊匹配模式（可含 `provider/id` 与 `:<thinking>` 后缀）；
   - `thinkingLevel`：`off | minimal | low | medium | high | xhigh | max`。
-  - 三者均为可选；**不传时使用 Worker 默认配置：`deepseek` / `deepseek-flash` / `thinking=high`**（可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `_DEFAULT_MODEL` / `_DEFAULT_THINKING` 覆盖，不改全局 Pi 设置，也不影响主 Pi 会话）。
+  - 三者均为可选；**不传时使用 Worker 默认配置：`antigravity` / `gemini-3.8-flash` / `thinking=high`**（可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `_DEFAULT_MODEL` / `_DEFAULT_THINKING` 覆盖，不改全局 Pi 设置，也不影响主 Pi 会话）。
   - 返回值包含本次实例的 `workerId` / `taskId` / `revision`，后续所有操作都以 `workerId` 定位。
   - 示例（显式覆盖）：`worker_start({ cwd: "E:/web/proj", title: "Worker", task: "...", provider: "local", model: "Qwen3.8-27B", thinkingLevel: "medium" })`。
 - `worker_list`：**无参数**列出当前活跃或未确认退出实例的有界摘要（`workerId` / `taskId` / 标题 / `cwd` / 生命周期 / 任务 / 活动状态 / 创建时间 / 模型摘要），单次最多返回 20 条并报告 `total`/`truncated`，标题/cwd/模型等长文本均截断为有界内容。列表只用于概览，**不替代** `worker_status`；错误、报告与事件明细仍须按 `workerId` 查。
