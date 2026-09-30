@@ -63,6 +63,50 @@ const EVICTABLE_INBOX_EVENT_TYPES = new Set([
 ]);
 
 /**
+ * 可操作关键事件白名单（审慎收敛）。
+ *
+ * 只有这些事件才会：
+ * 1. 写入收件箱后主动用 `pi.sendMessage` 唤醒主代理（空闲开新轮 / 忙碌 followUp 排队）；
+ * 2. 作为 `worker_wait` 的匹配目标。
+ *
+ * 其余过程性事件（activity / model_changed / report_candidate / task_accepted /
+ * followup_accepted / local_input / worker_ready / child_spawned 等）绝不触发推送，
+ * 也不会让 `worker_wait` 提前返回，避免高频轮询噪声。
+ */
+export const ACTIONABLE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  // 交付/提问/阻塞/失败回执：需要主代理验收或回复
+  "report_committed",
+  // 回执缺失：任务结束但没有有效交付，需要人工判断
+  "report_missing",
+  // Worker 合作式中止
+  "stopped",
+  // 连接断开 / 心跳失联：需要主代理介入
+  "disconnected",
+  "unresponsive",
+  // 子进程退出 / 启动明确失败
+  "child_exit",
+  "launch_failed",
+  // 关闭但未确认进程退出：占位可能残留，需要人工处理
+  "child_exit_unconfirmed",
+  // 关键回执被拒（缓存满）：需要主代理知情并采取措施
+  "report_rejected",
+  "inbox_rejected",
+]);
+
+/** 主动通知使用 custom message 的 customType（便于 UI 渲染与检索） */
+export const WORKER_NOTIFICATION_CUSTOM_TYPE = "pi-terminal-worker:event";
+
+/** 主动通知中事件摘要的最大字符数；超出截断，完整内容始终可用 worker_status 拉取 */
+export const MAX_NOTIFICATION_SUMMARY_CHARS = 1500;
+
+/** `worker_wait` 默认等待时长（5 分钟），避免默认长挂起 */
+export const DEFAULT_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
+/** `worker_wait` 允许的最大等待时长（10 分钟） */
+export const MAX_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
+/** `worker_wait` 允许的最小等待时长（保留显式短 timeout 兼容） */
+export const MIN_WAIT_TIMEOUT_MS = 1000;
+
+/**
  * Supervisor (bootstrap) 连接允许处理的消息类型白名单。
  * ack / error (带 replyTo) 通常已被传输层消费，此处仍纳入以防未匹配的残余消息。
  */
@@ -267,6 +311,9 @@ interface Waiter {
   resolve: (res: { event: InboxEvent; cursor: number }) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  /** 可选的取消信号（AbortSignal），取消时必须移除 waiter 并拒绝 promise */
+  signal?: AbortSignal;
+  onAbort?: () => void;
 }
 
 export class ControllerManager {
@@ -289,6 +336,12 @@ export class ControllerManager {
   private cursorCounter = 0;
   private inboxBytes = 0;
   private waiters: Waiter[] = [];
+  /**
+   * 默认 worker_wait 的消费游标（按实例隔离）。
+   * 未显式传 afterCursor 时从该游标之后开始，保证默认调用不会重复返回同一事件；
+   * 显式传 afterCursor 仍可重放历史事件。
+   */
+  private lastWaitCursor = 0;
 
   /** 可淘汰事件被静默丢弃的累计计数（仅过程性事件） */
   private droppedInboxEvents = 0;
@@ -384,12 +437,25 @@ export class ControllerManager {
     this.waiters = [];
     for (const w of waiters) {
       clearTimeout(w.timer);
+      this.detachAbort(w);
       try {
         w.reject(err);
       } catch {
         // 等待者已 settle 时忽略
       }
     }
+  }
+
+  /** 摘掉 waiter 的 AbortSignal 监听，避免取消后残留监听器 */
+  private detachAbort(w: Waiter): void {
+    if (w.signal && w.onAbort) {
+      w.signal.removeEventListener("abort", w.onAbort);
+    }
+  }
+
+  /** 从 waiters 中精确移除一个 waiter（超时/取消时必须调用，绝不泄漏） */
+  private removeWaiter(target: Waiter): void {
+    this.waiters = this.waiters.filter((w) => w !== target);
   }
 
   /** 注册一条已认证连接的销毁清理，并保留反注册句柄 */
@@ -436,6 +502,7 @@ export class ControllerManager {
     this.inbox = [];
     this.cursorCounter = 0;
     this.inboxBytes = 0;
+    this.lastWaitCursor = 0;
     this.droppedInboxEvents = 0;
     this.inboxRejectedEvents = 0;
     this.reportCacheRejected = 0;
@@ -459,6 +526,7 @@ export class ControllerManager {
     taskId?: string,
     revision?: number,
     runId?: number,
+    options: { notify?: boolean } = {},
   ): InboxEvent {
     const inst = this.workerManager.getInstance();
     const event: InboxEvent = {
@@ -501,8 +569,13 @@ export class ControllerManager {
     this.inbox.push(event);
     this.inboxBytes += bytes;
 
-    // 写入成功后才唤醒匹配的 Waiter
+    // 写入成功后才唤醒匹配的 Waiter（仅可操作关键事件）
     this.notifyWaiters(event);
+
+    // 关键事件的收件箱写入成功后，再主动通知主代理。
+    // 通知失败绝不影响收件箱写入/ACK：sendMessage 异常在本方法内部被吞掉，
+    // 且始终保留 worker_wait 作为兜底。
+    if (options.notify !== false) this.notifyProactive(event);
 
     return event;
   }
@@ -617,16 +690,94 @@ export class ControllerManager {
   }
 
   private notifyWaiters(event: InboxEvent): void {
+    // 只匹配可操作关键事件：普通进度（activity / report_candidate / 启动成功等）
+    // 绝不让 worker_wait 提前返回。
+    if (!ACTIONABLE_EVENT_TYPES.has(event.type)) return;
     const remaining: Waiter[] = [];
     for (const w of this.waiters) {
       if (event.cursor > w.afterCursor && event.workerId === w.workerId && event.taskId === w.taskId) {
         clearTimeout(w.timer);
+        this.detachAbort(w);
+        // 消费游标推进：默认 worker_wait 下次从该事件之后继续，避免重复返回。
+        this.lastWaitCursor = Math.max(this.lastWaitCursor, event.cursor);
         w.resolve({ event, cursor: event.cursor });
       } else {
         remaining.push(w);
       }
     }
     this.waiters = remaining;
+  }
+
+  /**
+   * 关键事件写入收件箱后主动唤醒主代理（空闲时开新轮，忙碌时 followUp 排队）。
+   *
+   * 安全边界：
+   * - 旧会话语义由入口回调负责：bindWorker / bindSupervisor 在 appendInbox 之前
+   *   已用 `isCurrentGeneration(gen)` 拦截旧 generation 的晚到消息，所以本方法只会
+   *   被当前会话的事件调用；
+   * - 下面的 `isCurrentGeneration(this.activeGeneration)` 只是 disposed 保护
+   *   （防已销毁实例继续发通知），并不能、也不宣称能拦截旧代际；
+   * - pi.sendMessage 缺失或抛错都被吞掉并降级为日志，绝不破坏收件箱/ACK 协议；
+   * - 发送失败不自动重试、不阻塞，始终保留 worker_wait 作为兜底。
+   */
+  private notifyProactive(event: InboxEvent): void {
+    if (!ACTIONABLE_EVENT_TYPES.has(event.type)) return;
+    // disposed 保护：已销毁实例的 activeGeneration 不再有效时不再发通知。
+    // 旧代际拦截发生在入口回调（bindWorker/bindSupervisor）的 gen 检查处。
+    if (!this.isCurrentGeneration(this.activeGeneration)) return;
+
+    try {
+      const send = (this.pi as { sendMessage?: ExtensionAPI["sendMessage"] }).sendMessage;
+      if (typeof send !== "function") return;
+      send.call(
+        this.pi,
+        {
+          customType: WORKER_NOTIFICATION_CUSTOM_TYPE,
+          content: [{ type: "text", text: this.buildNotificationText(event) }],
+          display: true,
+          details: {
+            eventId: event.eventId,
+            cursor: event.cursor,
+            type: event.type,
+            workerId: event.workerId,
+            taskId: event.taskId,
+            revision: event.revision,
+            runId: event.runId,
+          },
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch (err) {
+      console.warn(
+        `[Controller] 主动通知发送失败 (type=${event.type})，已忽略并保留 worker_wait 兜底:`,
+        err,
+      );
+    }
+  }
+
+  /** 构造有界的关键事件通知正文：含完整身份/游标与有界摘要，并明确后续动作。 */
+  private buildNotificationText(event: InboxEvent): string {
+    let summary: string;
+    try {
+      summary = JSON.stringify(event.payload ?? {});
+    } catch {
+      summary = String(event.payload);
+    }
+    if (typeof summary !== "string") summary = String(summary);
+    if (summary.length > MAX_NOTIFICATION_SUMMARY_CHARS) {
+      summary = summary.slice(0, MAX_NOTIFICATION_SUMMARY_CHARS) + "…(已截断)";
+    }
+    const identity =
+      `workerId=${event.workerId || "(none)"} taskId=${event.taskId ?? "(none)"} ` +
+      `revision=${event.revision ?? "-"} runId=${event.runId ?? "-"} ` +
+      `cursor=${event.cursor} eventId=${event.eventId}`;
+    return (
+      `[pi-terminal-worker] 关键事件 ${event.type} 已到达。\n` +
+      `${identity}\n` +
+      `摘要: ${summary}\n` +
+      `处理建议: 用 worker_status({ workerId, eventId }) 获取完整详情与当前状态；` +
+      `无需立即处理时可结束当前轮，后续关键事件会自动唤醒，不必循环调用 worker_wait。`
+    );
   }
 
   /**
@@ -905,9 +1056,15 @@ export class ControllerManager {
           this.appendInbox("child_spawned", p);
         } else if (env.type === "child_exit") {
           const p = env.payload as ChildExitPayload;
+          // 在状态变成 closed 前识别预期退出。仅在 close 仍在等待且正常退出时
+          // 静默：工具本身会返回关闭结果；超时后晚到的退出及异常退出仍需通知。
+          const expectedExit =
+            inst?.lifecycleState === "closing" &&
+            this.closeInFlight?.workerId === inst.workerId &&
+            p.code === 0 && p.signal === null;
           this.childExitConfirmed = true;
           this.workerManager.updateLifecycleState("closed");
-          this.appendInbox("child_exit", p);
+          this.appendInbox("child_exit", p, undefined, undefined, undefined, { notify: !expectedExit });
           this.stopHeartbeat();
         } else if (env.type === "launch_failed") {
           const p = env.payload as LaunchFailedPayload;
@@ -1529,7 +1686,9 @@ export class ControllerManager {
         workerId,
         taskId,
         revision: 1,
-        message: "Worker 已成功启动并接收初始任务",
+        message:
+          "Worker 已成功启动并接收初始任务。后续关键事件会自动唤醒本会话（空闲时开新轮，忙碌时 followUp 排队），" +
+          "无需循环 worker_wait；如需诊断或同步确认再显式调用 worker_wait。",
       };
     } catch (err: unknown) {
       const inst = this.workerManager.getInstance();
@@ -1724,18 +1883,30 @@ export class ControllerManager {
       workerId: params.workerId,
       taskId: params.taskId,
       revision,
-      message: `已成功发送 ${params.kind} 说明至 Worker`,
+      message:
+        `已成功发送 ${params.kind} 说明至 Worker。后续关键事件（交付/提问/阻塞/停止/断连等）会自动唤醒本会话，` +
+        `无需连续 worker_wait。`,
     };
   }
 
   /**
    * 工具：worker_wait
+   *
+   * 语义（避免高频轮询）：
+   * - 只匹配 ACTIONABLE_EVENT_TYPES 中的可操作关键事件；普通进度绝不唤醒。
+   * - 未显式传 afterCursor 时，从上次已消费游标之后开始（默认消费，不重复返回同一事件）；
+   *   显式传 afterCursor 仍可重放历史关键事件。
+   * - 超时/取消必须移除 waiter，绝不泄漏；默认 5 分钟，上限 10 分钟。
+   * - 支持 AbortSignal 取消（如可行）。
    */
-  public async handleWorkerWait(params: {
-    workerId: string;
-    afterCursor?: number;
-    timeoutMs?: number;
-  }): Promise<{
+  public async handleWorkerWait(
+    params: {
+      workerId: string;
+      afterCursor?: number;
+      timeoutMs?: number;
+    },
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{
     event: {
       type: string;
       cursor: number;
@@ -1754,23 +1925,49 @@ export class ControllerManager {
     }
 
     const gen = this.activeGeneration;
-    const afterCursor = params.afterCursor ?? 0;
-    const timeout = Math.min(Math.max(params.timeoutMs ?? 30000, 1000), 60000);
-
-    // 检查是否有当前 Worker/Task 的现有事件
-    const existing = this.inbox.find(
-      (e) => e.cursor > afterCursor && e.workerId === inst.workerId && e.taskId === inst.taskId,
+    const afterCursor = params.afterCursor !== undefined ? params.afterCursor : this.lastWaitCursor;
+    const timeout = Math.min(
+      Math.max(params.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, MIN_WAIT_TIMEOUT_MS),
+      MAX_WAIT_TIMEOUT_MS,
     );
+
+    const isMatch = (e: InboxEvent): boolean =>
+      e.cursor > afterCursor &&
+      e.workerId === inst.workerId &&
+      e.taskId === inst.taskId &&
+      ACTIONABLE_EVENT_TYPES.has(e.type);
+
+    // 检查是否有当前 Worker/Task 的现有可操作关键事件
+    const existing = this.inbox.find(isMatch);
     let selectedEvent: InboxEvent;
 
     if (existing) {
+      // 立即命中也要推进默认游标，避免下一次默认调用重复返回同一事件。
+      this.lastWaitCursor = Math.max(this.lastWaitCursor, existing.cursor);
       selectedEvent = existing;
+    } else if (options.signal?.aborted) {
+      throw new Error("worker_wait 已被调用方取消");
     } else {
       // 挂起等待
       selectedEvent = await new Promise<InboxEvent>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          // 会话已切换：不要 resolve 伪事件去污染新会话；等待者已被 rejectWaiters 结束。
-          if (!this.isCurrentGeneration(gen)) return;
+        const waiter: Waiter = {
+          afterCursor,
+          workerId: inst.workerId,
+          taskId: inst.taskId,
+          resolve: (res) => resolve(res.event),
+          reject,
+          timer: undefined as unknown as NodeJS.Timeout,
+        };
+
+        waiter.timer = setTimeout(() => {
+          // 超时必须先移除 waiter（绝不泄漏），再结算 promise
+          this.removeWaiter(waiter);
+          this.detachAbort(waiter);
+          if (!this.isCurrentGeneration(gen)) {
+            // 会话已切换：拒绝而不是挂起，也不返回伪事件污染新会话
+            reject(new Error("会话已切换，等待已被取消"));
+            return;
+          }
           // 超时返回伪事件，携带当前状态与诊断计数
           resolve({
             cursor: this.cursorCounter,
@@ -1791,14 +1988,18 @@ export class ControllerManager {
           });
         }, timeout);
 
-        this.waiters.push({
-          afterCursor,
-          workerId: inst.workerId,
-          taskId: inst.taskId,
-          resolve: (res) => resolve(res.event),
-          reject,
-          timer,
-        });
+        if (options.signal) {
+          waiter.signal = options.signal;
+          waiter.onAbort = () => {
+            this.removeWaiter(waiter);
+            clearTimeout(waiter.timer);
+            this.detachAbort(waiter);
+            reject(new Error("worker_wait 已被调用方取消"));
+          };
+          options.signal.addEventListener("abort", waiter.onAbort, { once: true });
+        }
+
+        this.waiters.push(waiter);
       });
     }
 
@@ -2141,7 +2342,9 @@ export class ControllerManager {
     this.pi.registerTool({
       name: "worker_start",
       label: "Worker Start",
-      description: "在独立的终端窗口 (Windows Terminal，缺失时回退 PowerShell/CMD) 中启动一个交互式 Worker Pi，派发初始任务并建立监督通信。",
+      description:
+        "在独立的终端窗口 (Windows Terminal，缺失时回退 PowerShell/CMD) 中启动一个交互式 Worker Pi，派发初始任务并建立监督通信。" +
+        "Worker 的关键事件（交付/提问/阻塞/停止/断连等）会主动唤醒本会话：空闲时开新轮，忙碌时 followUp 排队，无需轮询。",
       executionMode: "sequential",
       parameters: Type.Object({
         cwd: Type.String({ description: "Worker 工作的根目录 (必须为绝对路径)" }),
@@ -2174,7 +2377,8 @@ export class ControllerManager {
     this.pi.registerTool({
       name: "worker_send",
       label: "Worker Send",
-      description: "向存活的 Worker 发送补充说明、问题回复或发起新一轮返修 (revision)。",
+      description:
+        "向存活的 Worker 发送补充说明、问题回复或发起新一轮返修 (revision)。发送后无需连续等待，后续关键事件会自动唤醒本会话。",
       executionMode: "sequential",
       parameters: Type.Object({
         workerId: Type.String(),
@@ -2198,15 +2402,22 @@ export class ControllerManager {
     this.pi.registerTool({
       name: "worker_wait",
       label: "Worker Wait",
-      description: "等待 Worker 产生关键事件 (提问、阻塞、交付审查 ready_for_review、失败、停止或断开连接)。",
+      description:
+        "同步等待 Worker 的可操作关键事件（交付/提问/阻塞/停止/断连/退出等）——仅作为恢复、诊断或同步等待的兜底。" +
+        "默认从上次已消费游标之后匹配（不重复返回同一事件）；显式传 afterCursor 可重放历史事件。" +
+        "关键事件平时会自动唤醒本会话，无需用它轮询。",
       executionMode: "sequential",
       parameters: Type.Object({
         workerId: Type.String(),
-        afterCursor: Type.Optional(Type.Number({ description: "只等待晚于该游标的事件" })),
-        timeoutMs: Type.Optional(Type.Number({ description: "等待超时毫秒数 (1000 - 60000)" })),
+        afterCursor: Type.Optional(
+          Type.Number({ description: "只等待晚于该游标的事件；不传则使用上次已消费游标（避免重复）" }),
+        ),
+        timeoutMs: Type.Optional(
+          Type.Number({ description: `等待超时毫秒数 (默认 ${DEFAULT_WAIT_TIMEOUT_MS}，最小 ${MIN_WAIT_TIMEOUT_MS}，最大 ${MAX_WAIT_TIMEOUT_MS})` }),
+        ),
       }),
-      execute: async (_toolCallId: string, params: any) => {
-        const res = await this.handleWorkerWait(params);
+      execute: async (_toolCallId: string, params: any, signal?: AbortSignal) => {
+        const res = await this.handleWorkerWait(params, { signal });
         return {
           content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
           details: res,

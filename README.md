@@ -10,6 +10,7 @@
 - **模型状态实时上报**：Worker 在 `worker_ready` 上报实际 provider/modelId/thinkingLevel；会话内 `/model`、`/thinking` 切换后自动刷新主控端状态。
 - **状态三维分离**：严格区分生命周期（`launching/connected/closed` 等）、任务状态（`created/running/ready_for_review/accepted` 等）与 Pi 活动状态（`idle/busy`）。
 - **健全的回执与验收闭环**：候选回执在稳定边界确认；存在未解决问题或测试失败时严格拒绝验收。
+- **主动事件通知（默认不需要轮询）**：关键事件（交付回执、提问、阻塞、停止、断连/失联、启动失败、进程退出等）写入收件箱后会主动通过 `pi.sendMessage` 唤醒主代理——空闲时开新轮、忙碌时 `followUp` 排队。普通进度（活动状态、候选回执、启动成功等）不会推送，避免噪声。`worker_wait` 仅作为恢复/诊断/同步等待兜底。
 - **人工介入识别**：实时识别执行窗口的人工敲键盘干预，自动作废候选回执并暂停后续排队派发。
 - **启动竞态防护**：主控端等待真实 `worker_ready`（而非仅管道连接）后才派发初始任务；Worker 侧 `session_start` 会补派发早到队列中的任务。
 
@@ -48,8 +49,8 @@ Worker 侧握手时序防护：`worker_ready` 必须等 `hello_ok` 认证确认�
   - `thinkingLevel`：`off | minimal | low | medium | high | xhigh | max`。
   - 三者均为可选；**不传时使用 Worker 默认配置：`deepseek` / `deepseek-flash` / `thinking=high`**（可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `_DEFAULT_MODEL` / `_DEFAULT_THINKING` 覆盖，不改全局 Pi 设置，也不影响主 Pi 会话）。
   - 示例（显式覆盖）：`worker_start({ cwd: "E:/web/proj", title: "Worker", task: "...", provider: "local", model: "Qwen3.8-27B", thinkingLevel: "medium" })`。
-- `worker_send`：发送补充说明、回复提问或发起返修 (`revision`)。
-- `worker_wait`：等待执行端关键事件到达（游标收件箱机制）。
+- `worker_send`：发送补充说明、回复提问或发起返修 (`revision`)；发送后无需连续等待，后续关键事件会自动唤醒本会话。
+- `worker_wait`：同步等待可操作关键事件——**仅作为恢复/诊断/同步等待兜底**。只匹配关键事件（普通进度不唤醒）；默认从上次已消费游标之后匹配（不重复返回同一事件），显式传 `afterCursor` 可重放；默认等待 5 分钟，上限 10 分钟（显式短 `timeoutMs` 兼容，最小 1 秒）。
 - `worker_status`：查询状态或分页拉取超长详情。
 - `worker_stop`：合作式中止任务。
 - `worker_close`：任务验收通过 (`accepted`) 或放弃 (`abandoned`) 并确认关闭。
@@ -72,6 +73,27 @@ Worker 窗口是完整交互 Pi，可用 Pi 原生命令调整模型与思考级
 - `/model`：选择模型；在该界面按 `Ctrl+S` 可保存为新会话默认模型。
 - `/thinking`：选择当前模型支持的思考级别；`Ctrl+S` 保存为启动级别。
 - 切换后主控端会自动收到 `model_changed` 上报，`worker_status` 中 provider/model/thinkingLevel 即时刷新，无需重启 Worker。
+
+## 主动通知与等待语义
+
+主代理无需高频 `worker_wait`。以下可操作关键事件写入收件箱后会主动通知：
+
+| 类别 | 事件 |
+|---|---|
+| 交付/回执 | `report_committed`（交付、提问、阻塞、失败）、`report_missing` |
+| 生命周期/连接 | `stopped`、`disconnected`、`unresponsive`、`child_exit`、`launch_failed`、`child_exit_unconfirmed` |
+| 协议异常 | `report_rejected`、`inbox_rejected` |
+
+通知机制：
+
+- 调用 `pi.sendMessage` 注入 custom message（`customType: pi-terminal-worker:event`），携带 `workerId/taskId/revision/runId/cursor/eventId` 与**有界摘要**；
+- 使用 `{ triggerTurn: true, deliverAs: "followUp" }`：主代理空闲时开启新轮，忙碌时作为 follow-up 排队；
+- 普通过程性事件（`activity` / `model_changed` / `report_candidate` / `task_accepted` / `followup_accepted` / `local_input` / 启动成功等）**绝不推送**；
+- 主动 `worker_close` 正在等待时的正常退出（`code: 0`、`signal: null`）仅入箱并唤醒显式等待者，关闭结果由工具返回，不额外触发模型轮次；非主动退出、异常退出及关闭超时后的退出仍主动通知；
+- 通知失败（包括 `pi.sendMessage` 抛错）不会破坏收件箱写入/ACK 协议，也不阻塞后续处理；始终保留 `worker_wait` 兜底；
+- 通知严格绑定当前会话 generation，会话切换后的晚到事件绝不推送到新会话。
+
+典型用法：`worker_start` / `worker_send` 后直接结束当前轮，关键事件到达时会自动唤醒；收到通知后用 `worker_status({ workerId, eventId })` 拉取完整详情并按需处理，不要连续调用 `worker_wait` 轮询。
 
 ## 限制
 

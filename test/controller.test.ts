@@ -342,10 +342,10 @@ describe("Controller and Single Worker Mutex Tests", () => {
       timeoutMs: 1000,
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
-    (ctrl as any).appendInbox("current_event", { note: "current" });
+    (ctrl as any).appendInbox("report_committed", { note: "current" });
 
     const result = await pending;
-    assert.strictEqual(result.event.type, "current_event");
+    assert.strictEqual(result.event.type, "report_committed");
   });
   it("worker_wait 与收件箱游标及分页查询", async () => {
     const fakePi = new FakePiAPI();
@@ -359,8 +359,8 @@ describe("Controller and Single Worker Mutex Tests", () => {
       "Title",
     );
 
-    // 写入一条收件箱事件
-    (ctrl as any).appendInbox("test_event", { note: "first event" });
+    // 写入一条可操作关键事件（只有关键事件才会被 worker_wait 匹配）
+    (ctrl as any).appendInbox("report_committed", { note: "first event" });
 
     // 用 afterCursor: 0 等待，应立即返回现有事件
     const res1 = await ctrl.handleWorkerWait({
@@ -368,7 +368,7 @@ describe("Controller and Single Worker Mutex Tests", () => {
       afterCursor: 0,
       timeoutMs: 1000,
     });
-    assert.strictEqual(res1.event.type, "test_event");
+    assert.strictEqual(res1.event.type, "report_committed");
     assert.strictEqual(res1.event.cursor, 1);
 
     // 用 status 分页查询
@@ -381,6 +381,120 @@ describe("Controller and Single Worker Mutex Tests", () => {
     assert.ok(statusRes.eventDetail);
     assert.strictEqual(statusRes.eventDetail.eventId, res1.event.eventId);
     assert.ok(statusRes.eventDetail.content.length <= 10);
+  });
+
+  it("worker_wait 只匹配可操作关键事件：普通进度不提前返回", async () => {
+    const ctrl = new ControllerManager(new FakePiAPI() as any);
+    ctrl.workerManager.acquireLaunchSlot("ctrl-1", "worker-1", "task-1", process.cwd(), "T");
+
+    const pending = ctrl.handleWorkerWait({ workerId: "worker-1", timeoutMs: 1000 });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual((ctrl as any).waiters.length, 1);
+
+    // 普通进度事件写入不得唤醒 waiter
+    (ctrl as any).appendInbox("activity", { state: "busy" });
+    (ctrl as any).appendInbox("report_candidate", { summary: "wip" });
+    (ctrl as any).appendInbox("task_accepted", { taskId: "task-1" }, "task-1", 1, 1);
+
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(settled, false, "普通进度不得让 worker_wait 提前返回");
+
+    const res = await pending;
+    assert.strictEqual(res.event.type, "wait_timeout");
+    assert.strictEqual((ctrl as any).waiters.length, 0);
+  });
+
+  it("worker_wait 超时移除 waiter，默认游标消费不重复、显式 afterCursor 可重放", async () => {
+    const ctrl = new ControllerManager(new FakePiAPI() as any);
+    ctrl.workerManager.acquireLaunchSlot("ctrl-1", "worker-1", "task-1", process.cwd(), "T");
+
+    (ctrl as any).appendInbox("report_committed", { n: 1 }, "task-1", 1, 1);
+
+    // 首次默认等待立即命中
+    const first = await ctrl.handleWorkerWait({ workerId: "worker-1", timeoutMs: 1000 });
+    assert.strictEqual(first.event.type, "report_committed");
+    assert.strictEqual((ctrl as any).lastWaitCursor, first.event.cursor);
+
+    // 默认游标已推进：默认再等同一事件不会再返回，而是超时
+    const second = await ctrl.handleWorkerWait({ workerId: "worker-1", timeoutMs: 1000 });
+    assert.strictEqual(second.event.type, "wait_timeout");
+    assert.strictEqual((ctrl as any).waiters.length, 0, "超时后不得泄漏 waiter");
+
+    // 显式 afterCursor 仍可重放同一关键事件
+    const replay = await ctrl.handleWorkerWait({
+      workerId: "worker-1",
+      afterCursor: 0,
+      timeoutMs: 1000,
+    });
+    assert.strictEqual(replay.event.eventId, first.event.eventId);
+  });
+
+  it("worker_wait 支持 AbortSignal 取消并清理 waiter", async () => {
+    const ctrl = new ControllerManager(new FakePiAPI() as any);
+    ctrl.workerManager.acquireLaunchSlot("ctrl-1", "worker-1", "task-1", process.cwd(), "T");
+
+    const ac = new AbortController();
+    const pending = ctrl.handleWorkerWait(
+      { workerId: "worker-1", timeoutMs: 60000 },
+      { signal: ac.signal },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual((ctrl as any).waiters.length, 1);
+
+    ac.abort();
+    await assert.rejects(() => pending, /取消/);
+    assert.strictEqual((ctrl as any).waiters.length, 0, "取消后必须移除 waiter");
+
+    // 已取消的 signal 直接调用也不得挂起
+    const already = new AbortController();
+    already.abort();
+    await assert.rejects(
+      () => ctrl.handleWorkerWait({ workerId: "worker-1", timeoutMs: 60000 }, { signal: already.signal }),
+      /取消/,
+    );
+    assert.strictEqual((ctrl as any).waiters.length, 0);
+  });
+
+  it("worker_wait 通过注册工具 execute 接收 signal 并支持取消", async () => {
+    const fakePi = new FakePiAPI();
+    const ctrl = new ControllerManager(fakePi as any);
+    ctrl.registerToolsAndCommands();
+    ctrl.workerManager.acquireLaunchSlot("ctrl-1", "worker-1", "task-1", process.cwd(), "T");
+
+    const tool = fakePi.tools.get("worker_wait") as any;
+    assert.ok(tool, "worker_wait 工具必须已注册");
+
+    const ac = new AbortController();
+    const pending = tool.execute("t-wait", { workerId: "worker-1", timeoutMs: 60000 }, ac.signal);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual((ctrl as any).waiters.length, 1, "工具调用应挂起一个 waiter");
+
+    ac.abort();
+    await assert.rejects(() => pending, /取消/);
+    assert.strictEqual((ctrl as any).waiters.length, 0, "execute 取消后必须移除 waiter");
+    ctrl.dispose();
+  });
+
+  it("会话切换拒绝挂起 waiter 并重置默认消费游标", async () => {
+    const ctrl = new ControllerManager(new FakePiAPI() as any);
+    ctrl.workerManager.acquireLaunchSlot("ctrl-1", "worker-1", "task-1", process.cwd(), "T");
+    (ctrl as any).appendInbox("report_committed", { n: 1 }, "task-1", 1, 1);
+    await ctrl.handleWorkerWait({ workerId: "worker-1", timeoutMs: 1000 });
+    assert.strictEqual((ctrl as any).lastWaitCursor, 1);
+
+    const pending = ctrl.handleWorkerWait({ workerId: "worker-1", timeoutMs: 60000 });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual((ctrl as any).waiters.length, 1);
+
+    await ctrl.handleSessionStart();
+    assert.strictEqual((ctrl as any).waiters.length, 0, "会话切换必须清空 waiter");
+    assert.strictEqual((ctrl as any).lastWaitCursor, 0, "会话切换重置默认消费游标");
+    await assert.rejects(() => pending, /会话已切换/);
+    await ctrl.dispose();
   });
 });
 
