@@ -44,6 +44,9 @@
   },
   "author": "mozhi012 <mozhi0012@gmail.com>",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "bugs": {
     "url": "https://github.com/mozhi012/pi-terminal-worker/issues"
   },
