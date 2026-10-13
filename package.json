@@ -1,6 +1,6 @@
 {
   "name": "@mozhi0012/pi-terminal-worker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi coding agent extension for supervised worker Pi in independent Windows Terminal window with bi-directional IPC",
   "type": "module",
   "main": "./dist/extension.js",
