@@ -599,8 +599,13 @@ export class WorkerManager {
       this.staleCallbacksIgnored++;
       return false;
     }
+    // deliverAs: "followUp" 针对 pi 1.2.0 的竞态加固：isIdle() 检查与 prompt() 内部
+    // 异步间隙之间若有其他 run 启动（会话即算 busy），无 deliverAs 的 sendUserMessage
+    // 会抛 "Agent is already processing"，且被 pi 扩展 API 层 catch 成扩展错误事件、
+    // 消息静默丢失；传 followUp 后改为排队。空闲时该选项被忽略，行为不变。
     this.pi.sendUserMessage(text, {
       expandPromptTemplates: false,
+      deliverAs: "followUp",
     });
     return true;
   }

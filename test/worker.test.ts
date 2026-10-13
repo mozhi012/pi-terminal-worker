@@ -227,6 +227,8 @@ describe("启动竞态回归测试", () => {
     await fakePi.emitPiEvent("session_start", {}, fakeCtx);
     assert.strictEqual(fakePi.sentUserMessages.length, 1);
     assert.ok(fakePi.sentUserMessages[0].content.includes("初始任务文本"));
+    // pi 1.2.0 竞态加固：派发必须携带 deliverAs: "followUp"，否则 run 启动窗口内会静默丢消息
+    assert.strictEqual(fakePi.sentUserMessages[0].options?.deliverAs, "followUp");
 
     const ready = await waitFor(() =>
       receivedEnvelopes.find((e) => e.type === "worker_ready"),
