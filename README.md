@@ -4,6 +4,7 @@
 
 ## 特性
 
+- **阶段主代理 lead（0.2.0）**：支持 `L0 主控 → L1 lead → L2 worker` 两层嵌套。lead 同时向上提交回执、向下派发并验收执行 Worker；禁止继续嵌套 lead。
 - **多 Worker 并发**：主代理可按需多次调用 `worker_start`，同一主 Pi 会话同时监督多个独立窗口中的 Worker；每个 Worker 拥有独立的窗口/进程、命名管道、两条连接、token、收件箱、报告缓存、心跳与关闭流程，互不串线。一个 Worker 失败、超时、断连或退出不影响其他 Worker。
 - **独立终端交互**：优先用 `wt.exe` 启动独立交互窗口；WT 缺失时自动回退 PowerShell (EncodedCommand 新控制台)，再回退 `cmd.exe /d /v:off`；均缺失时明确报错失败，不写任何临时任务文件。
 - **正常扩展加载**：Worker 按 Pi 默认规则加载用户、项目与内置扩展，并显式加载本扩展以建立通信；不复制主会话临时传入的其他 `-e` 参数，项目扩展仍受 Pi 信任规则约束。
@@ -48,17 +49,17 @@ Worker 侧握手时序防护：`worker_ready` 必须等 `hello_ok` 认证确认�
 
 七个工具由协调器只注册一次；除 `worker_start`/`worker_list` 外均要求显式 `workerId`，按 ID 精确路由，绝不隐式选择“最近创建”的实例（未知/已移除 ID 返回 `NOT_FOUND`）。
 
-- `worker_start`：在独立终端窗口启动 Worker 并派发初始任务；每次调用新建一个独立实例，不提供 `count` 参数。可选模型参数：
+- `worker_start`：在独立终端窗口启动 Worker 并派发初始任务；每次调用新建一个独立实例，不提供 `count` 参数。可选 `role: "worker" | "lead"`，默认 `"worker"`；只有无 `PI_TERMINAL_WORKER_ROLE` 的顶层主控可启动 lead。可选模型参数：
   - `provider`：限定 `--model` 查找的 provider（需与 `model` 配合）；
   - `model`：模型 ID 或模糊匹配模式（可含 `provider/id` 与 `:<thinking>` 后缀）；
   - `thinkingLevel`：`off | minimal | low | medium | high | xhigh | max`。
   - 三者均为可选；**不传时使用 Worker 默认配置：`antigravity` / `gemini-3.8-flash` / `thinking=high`**（可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `_DEFAULT_MODEL` / `_DEFAULT_THINKING` 覆盖，不改全局 Pi 设置，也不影响主 Pi 会话）。
   - 返回值包含本次实例的 `workerId` / `taskId` / `revision`，后续所有操作都以 `workerId` 定位。
   - 示例（显式覆盖）：`worker_start({ cwd: "E:/web/proj", title: "Worker", task: "...", provider: "local", model: "Qwen3.8-27B", thinkingLevel: "medium" })`。
-- `worker_list`：**无参数**列出当前活跃或未确认退出实例的有界摘要（`workerId` / `taskId` / 标题 / `cwd` / 生命周期 / 任务 / 活动状态 / 创建时间 / 模型摘要），单次最多返回 20 条并报告 `total`/`truncated`，标题/cwd/模型等长文本均截断为有界内容。列表只用于概览，**不替代** `worker_status`；错误、报告与事件明细仍须按 `workerId` 查。
+- `worker_list`：**无参数**列出当前活跃或未确认退出实例的有界摘要（`workerId` / `taskId` / `role` / 标题 / `cwd` / 生命周期 / 任务 / 活动状态 / 创建时间 / 模型摘要），单次最多返回 20 条并报告 `total`/`truncated`，标题/cwd/模型等长文本均截断为有界内容。列表只用于概览，**不替代** `worker_status`；错误、报告与事件明细仍须按 `workerId` 查。
 - `worker_send`：向指定 `workerId` 发送补充说明、回复提问或发起返修 (`revision`)；发送后无需连续等待，后续关键事件会自动唤醒本会话。
 - `worker_wait`：同步等待指定 `workerId` 的可操作关键事件——**仅作为恢复/诊断/同步等待兜底**。只匹配关键事件（普通进度不唤醒）；默认从该实例上次已消费游标之后匹配（不重复返回同一事件），显式传 `afterCursor` 可重放；默认等待 5 分钟，上限 10 分钟（显式短 `timeoutMs` 兼容，最小 1 秒）。不同 Worker 的游标/事件互不影响。
-- `worker_status`：按 `workerId` 查询状态或分页拉取超长详情；`eventId` 详情读取先定位该 `workerId`，不会跨实例读取。
+- `worker_status`：按 `workerId` 查询状态（含 `worker.role`）或分页拉取超长详情；`eventId` 详情读取先定位该 `workerId`，不会跨实例读取。
 - `worker_stop`：合作式中止指定 `workerId` 的任务，不释放占位。
 - `worker_close`：对指定 `workerId` 完成任务验收 (`accepted`) 或放弃 (`abandoned`) 并确认关闭；只有确认 `child_exit` 且关闭成功后才回收该实例。模型工具不允许 `force` 强杀。
 
@@ -75,6 +76,30 @@ Worker 侧握手时序防护：`worker_ready` 必须等 `hello_ok` 认证确认�
 - `worker_report`：执行模型提交进展、提问、阻碍或完成交付报告。
 - `/worker-status`：执行端查看受控连接状态。
 - `/worker-detach`：执行端人工脱钩，转为完全独立运行。
+
+### lead 阶段主代理与两层嵌套
+
+顶层 L0 可以这样派发阶段任务：
+
+```js
+worker_start({
+  role: "lead",
+  cwd: "E:/web/proj",
+  title: "阶段一 lead",
+  task: "拆分实现任务，派发执行 Worker，审查 diff 并验证，全部验收关闭后向我汇报。",
+  provider: "local",
+  model: "Qwen3.8-27B",
+  thinkingLevel: "high"
+})
+```
+
+- L1 lead 同时拥有 `worker_start/send/wait/status/list/stop/close` 和 `worker_report`。派发 L2 时省略 role 或指定 `role: "worker"`；调用 `worker_start({ role: "lead", ... })` 会被代码拒绝。L2 worker 只具备执行端能力，没有本扩展的 `worker_start`。
+- lead 负责划分不冲突的范围、核查交付、运行验证，并通过 `worker_close` 验收或放弃 L2；完成后必须 `worker_report` 向 L0 汇报，且应为本轮最后一个工具调用。
+- lead 仍有未验收/放弃且未确认退出的 L2（含断连占位）时，空闲上报 `activity.state=waiting_children`，不会误报 `report_missing`。全部结束后，下一次 `agent_settled` 仍无回执则恢复原有缺报判定。
+- L2 关键事件用 custom message 唤醒 lead，L0 下发任务/补充用来源为 extension 的用户消息；两者均使用 `followUp`。L0 消息在 WorkerManager 内按到达顺序暂存，再交给 Pi 队列；L2 通知直接交给 Pi 队列，不保证两个通道的全局先后，但均不会被识别为人工输入或清除对方队列。真实键盘输入仍作废候选并清空上行待派发消息。
+- lead 的 `/worker-status` 查看 L2，`/lead-status` 查看自身与 L0 的受控连接，`/worker-detach` 仅断开上行连接；下行管理仍保留。
+- 正常关闭 lead 时，`session_shutdown` 会等待协调器并行尽力关闭所有 L2 并释放连接、定时器与状态栏。lead 强杀、崩溃或手动关窗后，仅由该 lead 派发的 L2 supervisor 通过描述符 `ownerPid` 每 4 秒执行 `process.kill(pid, 0)` 判活；确认 owner 不存在后终止 L2 子进程并退出，子进程退出时清理监测定时器。Windows 使用 `taskkill /F /T` 终止 L2 进程树。
+- 顶层 L0 直接启动的 worker/lead 不设置 owner PID，仍保持管道断开后可继续本地 TUI 的行为。PID 监测无法区分 PID 重用，权限不足时也不会认定 owner 已退出；这些情况需人工确认遗留进程。
 
 ### Worker 窗口内的模型切换
 

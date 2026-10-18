@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import type { WorkerRole } from "./protocol.js";
 
 export interface WorkerDescriptor {
   version: 1;
@@ -13,6 +14,10 @@ export interface WorkerDescriptor {
   workerId: string;
   pipePath: string;
   bootstrapToken: string;
+  /** 缺省仅用于兼容旧描述符；新启动始终写入明确角色。 */
+  role?: WorkerRole;
+  /** 仅 lead 派发的 L2 设置，用于父进程异常退出后的级联清理。 */
+  ownerPid?: number;
 }
 
 /**
@@ -63,7 +68,9 @@ export function decodeDescriptor(raw: string): WorkerDescriptor {
       typeof parsed.controllerId !== "string" ||
       typeof parsed.workerId !== "string" ||
       typeof parsed.pipePath !== "string" ||
-      typeof parsed.bootstrapToken !== "string"
+      typeof parsed.bootstrapToken !== "string" ||
+      (parsed.role !== undefined && parsed.role !== "worker" && parsed.role !== "lead") ||
+      (parsed.ownerPid !== undefined && (!Number.isSafeInteger(parsed.ownerPid) || parsed.ownerPid <= 0))
     ) {
       throw new Error("描述符格式不符合规范");
     }

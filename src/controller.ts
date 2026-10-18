@@ -29,6 +29,8 @@ import {
   type Envelope,
   type HelloPayload,
   type LaunchPayload,
+  type WorkerRole,
+  resolveChildRole,
   type TaskPayload,
   type FollowupPayload,
   type AbortPayload,
@@ -1536,6 +1538,7 @@ export class ControllerManager {
     provider?: string;
     model?: string;
     thinkingLevel?: string;
+    role?: WorkerRole;
   }, probes: Partial<TerminalProbes> = {}, internal: {
     ids?: { controllerId?: string; workerId?: string; taskId?: string };
     bootstrapToken?: string;
@@ -1551,6 +1554,8 @@ export class ControllerManager {
     // 在 start 一开始锁定会话代际：后续每个 await 阶段都必须以该 gen 复核，
     // 避免会话切换/释放后仍 spawn、注册连接或改写新会话状态。
     const startGen = this.activeGeneration;
+    const role = resolveChildRole(params.role);
+    const ownerPid = process.env.PI_TERMINAL_WORKER_ROLE === "lead" ? process.pid : undefined;
     if (jsonByteLength({
       task: params.task,
       context: params.context,
@@ -1586,6 +1591,7 @@ export class ControllerManager {
       taskId,
       params.cwd,
       params.title,
+      role,
     );
 
     // 名额锁定后才清理上一实例遗留的连接引用：上一实例已 closed/被 force 释放，
@@ -1607,6 +1613,8 @@ export class ControllerManager {
         workerId,
         pipePath,
         bootstrapToken,
+        role,
+        ...(ownerPid === undefined ? {} : { ownerPid }),
       };
       const descB64 = encodeDescriptor(desc);
 
@@ -2408,6 +2416,7 @@ export class ControllerManager {
         "Worker 的关键事件（交付/提问/阻塞/停止/断连等）会主动唤醒本会话：空闲时开新轮，忙碌时 followUp 排队，无需轮询。",
       executionMode: "sequential",
       parameters: Type.Object({
+        role: Type.Optional(Type.Union([Type.Literal("worker"), Type.Literal("lead")], { description: "角色，默认 worker；仅顶层主控可启动 lead" })),
         cwd: Type.String({ description: "Worker 工作的根目录 (必须为绝对路径)" }),
         title: Type.String({ description: "Windows Terminal 窗口的标题" }),
         task: Type.String({ description: "初始任务需求与指令说明" }),

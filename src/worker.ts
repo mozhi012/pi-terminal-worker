@@ -32,6 +32,7 @@ import {
   type WorkerReportPayload,
   type WorkerReadyPayload,
   type ModelChangedPayload,
+  type WorkerRole,
 } from "./protocol.js";
 import { JsonlConnection } from "./transport.js";
 import { SessionGenerationManager } from "./lifecycle.js";
@@ -49,6 +50,12 @@ interface FollowupQueueItem {
   runId: number;
   message: string;
   sessionGeneration: number;
+}
+
+export interface WorkerManagerOptions {
+  role?: WorkerRole;
+  /** lead 的协调器提供查询；普通 worker 始终沿用无子实例语义。 */
+  getActiveChildCount?: () => number;
 }
 
 export class WorkerManager {
@@ -86,8 +93,13 @@ export class WorkerManager {
 
   private readonly strictProtocol: boolean;
 
-  constructor(private pi: ExtensionAPI, strictProtocol = false) {
+  private readonly role: WorkerRole;
+  private readonly getActiveChildCount: () => number;
+
+  constructor(private pi: ExtensionAPI, strictProtocol = false, options: WorkerManagerOptions = {}) {
     this.strictProtocol = strictProtocol;
+    this.role = options.role ?? (process.env.PI_TERMINAL_WORKER_ROLE === "lead" ? "lead" : "worker");
+    this.getActiveChildCount = options.getActiveChildCount ?? (() => 0);
     this.controllerId = process.env.PI_TERMINAL_WORKER_CONTROLLER_ID || "";
     this.workerId = process.env.PI_TERMINAL_WORKER_WORKER_ID || "";
     this.pipePath = process.env.PI_TERMINAL_WORKER_PIPE_PATH || "";
@@ -512,8 +524,12 @@ export class WorkerManager {
     parts.push(
       `执行与回执要求:`,
       `1. 按照方案在指定工作目录内修改代码并进行本地验证。`,
-      `2. 不得再派发子代理或启动新终端；超出允许范围或需要改变设计时，调用 worker_report(kind="blocked") 说明原因。`,
-      `3. 任务完成、遇到提问或出现阻碍时，必须调用 worker_report 工具提交回执。`,
+      this.role === "lead"
+        ? `2. 你是阶段主代理，可用 worker_* 派发执行 Worker（只能 worker 角色，不能嵌套 lead）。负责划分范围、审查交付与测试，完成验收后关闭子 Worker。超出允许范围或需要改变设计时，调用 worker_report(kind="blocked") 说明原因。`
+        : `2. 不得再派发子代理或启动新终端；超出允许范围或需要改变设计时，调用 worker_report(kind="blocked") 说明原因。`,
+      this.role === "lead"
+        ? `3. 完成验收、遇到提问或出现阻碍时，必须调用 worker_report 向上级主控汇报；worker_report 应是本轮最后一个工具调用。`
+        : `3. 任务完成、遇到提问或出现阻碍时，必须调用 worker_report 工具提交回执。`,
     );
 
     return parts.join("\n\n");
@@ -541,7 +557,7 @@ export class WorkerManager {
     item.sessionGeneration = gen;
     const queueItem = item as FollowupQueueItem;
 
-    if (ctx && ctx.isIdle() && !ctx.hasPendingMessages()) {
+    if ((this.role !== "lead" || this.followupQueue.length === 0) && ctx && ctx.isIdle() && !ctx.hasPendingMessages()) {
       // 立即派发分支同样校验代际：绝不把消息交给已失效的会话
       if (!this.isCurrentGeneration(queueItem.sessionGeneration)) {
         this.staleCallbacksIgnored++;
@@ -655,23 +671,8 @@ export class WorkerManager {
       }
     });
 
-    // 监听 session_shutdown
-    this.pi.on("session_shutdown", async () => {
-      // 幂等：重复触发不得再次 destroy / 抛错；先推进代际使所有旧回调立即失效，
-      // 之后旧回调不得再调用 sendUserMessage / abort / shutdown / setActiveTools
-      this.sessionGen.nextGeneration();
-      this.activeGeneration = this.sessionGen.generation;
-      this.currentContext = null;
-      this.clearQueue();
-      this.currentCandidate = null;
-      this.candidateInvalidated = true;
-
-      const conn = this.conn;
-      if (conn) {
-        this.conn = null;
-        conn.destroy();
-      }
-    });
+    // 监听 session_shutdown；lead 也会在下级异步清理前主动执行此幂等入口。
+    this.pi.on("session_shutdown", async () => this.dispose());
 
     // 监听 input 事件：识别本地用户在终端窗口键盘输入干预
     this.pi.on("input", async (event: InputEvent) => {
@@ -791,7 +792,8 @@ export class WorkerManager {
           }).catch(() => {});
         }
         this.currentCandidate = null;
-      } else if (!this.taskHasReported && this.currentTaskId) {
+      } else if (!this.taskHasReported && this.currentTaskId && !this.isWaitingForChildren() &&
+                 !(this.role === "lead" && (this.followupQueue.length > 0 || ctx.hasPendingMessages()))) {
         // 模型结束了但没有提交过回执
         if (this.conn && !this.conn.socket.destroyed) {
           this.conn.sendEnvelope({
@@ -845,11 +847,27 @@ export class WorkerManager {
             id: crypto.randomUUID(),
             seq: this.conn.nextSeq,
             type: "activity",
-            payload: { state: "idle" },
+            payload: { state: this.isWaitingForChildren() ? "waiting_children" : "idle" },
           }).catch(() => {});
         }
       });
     });
+  }
+
+  /** 先同步失效上行回调，再允许 lead 等待下级协调器的异步清理。 */
+  public dispose(): void {
+    this.activeGeneration = this.sessionGen.nextGeneration();
+    this.currentContext = null;
+    this.clearQueue();
+    this.currentCandidate = null;
+    this.candidateInvalidated = true;
+    const conn = this.conn;
+    this.conn = null;
+    conn?.destroy();
+  }
+
+  private isWaitingForChildren(): boolean {
+    return this.role === "lead" && this.getActiveChildCount() > 0;
   }
 
   private registerWorkerReportTool(): void {
@@ -969,7 +987,8 @@ export class WorkerManager {
   }
 
   private registerWorkerCommands(): void {
-    this.pi.registerCommand("worker-status", {
+    // lead 的 /worker-status 保留给下级协调器，上行受控状态使用独立命令。
+    this.pi.registerCommand(this.role === "lead" ? "lead-status" : "worker-status", {
       description: "查看当前 Worker 受控状态",
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
         const status = this.conn ? "已连接到 Controller" : "未连接 / 已脱钩";

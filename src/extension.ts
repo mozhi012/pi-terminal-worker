@@ -1,12 +1,12 @@
 /**
  * pi-terminal-worker 扩展统一入口
- * 根据环境变量 PI_TERMINAL_WORKER_ROLE 识别 controller 或 worker 角色并激活相应能力
+ * 根据环境变量 PI_TERMINAL_WORKER_ROLE 激活 controller / worker / lead 能力
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ControllerManager } from "./controller.js";
 import { MultiWorkerCoordinator } from "./multi-worker.js";
-import { WorkerManager } from "./worker.js";
+import { WorkerManager, type WorkerManagerOptions } from "./worker.js";
 import { WorkerStatusBarPoller, updateMultiWorkerUiStatus } from "./ui.js";
 
 // 生产入口固定开启严格协议校验 (入站 seq 严格递增 + Worker 任务身份校验)
@@ -16,8 +16,8 @@ export function createControllerManager(pi: ExtensionAPI): ControllerManager {
   return new ControllerManager(pi, STRICT_PROTOCOL);
 }
 
-export function createWorkerManager(pi: ExtensionAPI): WorkerManager {
-  return new WorkerManager(pi, STRICT_PROTOCOL);
+export function createWorkerManager(pi: ExtensionAPI, options: WorkerManagerOptions = {}): WorkerManager {
+  return new WorkerManager(pi, STRICT_PROTOCOL, options);
 }
 
 /**
@@ -31,15 +31,35 @@ export function createMultiWorkerCoordinator(pi: ExtensionAPI): MultiWorkerCoord
 export default function (pi: ExtensionAPI): void {
   const role = process.env.PI_TERMINAL_WORKER_ROLE;
 
-  if (role === "worker") {
+  if (role === "lead") {
+    setupLeadRole(pi);
+  } else if (role === "worker") {
     // 作为受控端 Worker 启动
     const worker = createWorkerManager(pi);
     worker.init().catch((err) => {
       console.error("[pi-terminal-worker] Worker 初始化失败:", err);
     });
-  } else {
+  } else if (role === undefined) {
     setupMultiWorkerControllerRole(pi);
+  } else {
+    throw new Error(`非法 PI_TERMINAL_WORKER_ROLE: ${role}`);
   }
+}
+
+/** lead 同时保留上行回执与下行协调能力，所有工具先注册再过滤 active tools。 */
+export function setupLeadRole(pi: ExtensionAPI): ControllerRoleHandle & { worker: WorkerManager; ready: Promise<void> } {
+  let coordinator: MultiWorkerCoordinator;
+  const worker = createWorkerManager(pi, {
+    role: "lead",
+    getActiveChildCount: () => coordinator.getActiveChildCount(),
+  });
+  // init 在首个 await 前注册上行钩子：session_start/shutdown 先作废旧上行回调，
+  // 再等待下级异步清理。active tools 的过滤发生在所有工具注册完毕后的 session_start。
+  const ready = worker.init();
+  const handle = setupMultiWorkerControllerRole(pi);
+  coordinator = handle.coordinator;
+  ready.catch((err) => console.error("[pi-terminal-worker] Lead 初始化失败:", err));
+  return { ...handle, worker, ready };
 }
 
 /** 主控端角色的可测试装配句柄 (生产入口不直接使用，仅供内部/测试注入) */

@@ -34,7 +34,7 @@ import {
   MIN_WAIT_TIMEOUT_MS,
   MAX_WAIT_TIMEOUT_MS,
 } from "./controller.js";
-import { ProtocolErrorCode } from "./protocol.js";
+import { ProtocolErrorCode, resolveChildRole, type WorkerRole } from "./protocol.js";
 import type { WorkerInstanceMetadata } from "./lifecycle.js";
 
 /** close 结果类型 (与 ControllerManager.handleWorkerClose 一致) */
@@ -42,6 +42,7 @@ type CloseResult = { ok: boolean; disposition: string; message: string };
 
 /** 协调器内登记的一个 Worker 实例 */
 export interface WorkerEntry {
+  readonly role: WorkerRole;
   readonly controllerId: string;
   readonly workerId: string;
   readonly taskId: string;
@@ -82,6 +83,7 @@ export interface MultiWorkerCoordinatorOptions {
 }
 
 export interface WorkerStartParams {
+  role?: WorkerRole;
   cwd: string;
   title: string;
   task: string;
@@ -95,6 +97,7 @@ export interface WorkerStartParams {
 
 /** worker_list 单条有界摘要（不含报告/事件明细，明细仍走 worker_status） */
 export interface WorkerListSummary {
+  role: WorkerRole;
   workerId: string;
   taskId: string;
   title: string;
@@ -190,6 +193,21 @@ export class MultiWorkerCoordinator {
     return this.entries.get(workerId);
   }
 
+  /** 未验收/放弃且未确认退出的子实例数，包含在途启动及失联占位。 */
+  public getActiveChildCount(): number {
+    let count = 0;
+    for (const entry of this.entries.values()) {
+      const inst = entry.controller.workerManager.getInstance();
+      if (inst) {
+        if (entry.controller.workerManager.hasActiveInstance() &&
+            inst.taskState !== "accepted" && inst.taskState !== "abandoned") count++;
+      } else if (entry.startPromise) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   /** 当前登记实例数量 */
   public get size(): number {
     return this.entries.size;
@@ -216,6 +234,7 @@ export class MultiWorkerCoordinator {
   private summarizeEntry(entry: WorkerEntry): WorkerListSummary {
     const inst = entry.controller.workerManager.getInstance();
     return {
+      role: entry.role,
       workerId: entry.workerId,
       taskId: entry.taskId,
       title: truncateForList(inst?.title ?? "", WORKER_LIST_MAX_TITLE),
@@ -361,9 +380,11 @@ export class MultiWorkerCoordinator {
     if (this.isDisposed) {
       throw new Error(`[${ProtocolErrorCode.INVALID_STATE}] 协调器已释放，不能再启动新的 Worker`);
     }
+    const role = resolveChildRole(params.role);
     const ids = this.generateUniqueIdentity();
     const controller = this.createController();
     const entry: WorkerEntry = {
+      role,
       controllerId: ids.controllerId,
       workerId: ids.workerId,
       taskId: ids.taskId,
@@ -383,7 +404,7 @@ export class MultiWorkerCoordinator {
     const epoch = this.epoch;
 
     // 在途 start 由 entry 自己持有：dispose 可对每个实例独立取消+等待，互不阻塞
-    const startPromise = controller.handleWorkerStart(params, {}, { ids });
+    const startPromise = controller.handleWorkerStart({ ...params, role }, {}, { ids });
     entry.startPromise = startPromise;
     try {
       const res = await startPromise;
@@ -651,6 +672,7 @@ export class MultiWorkerCoordinator {
         "Worker 的关键事件（交付/提问/阻塞/停止/断连等）会主动唤醒本会话：空闲时开新轮，忙碌时 followUp 排队，无需轮询。",
       executionMode: "parallel",
       parameters: Type.Object({
+        role: Type.Optional(Type.Union([Type.Literal("worker"), Type.Literal("lead")], { description: "角色，默认 worker；仅顶层主控可启动 lead" })),
         cwd: Type.String({ description: "Worker 工作的根目录 (必须为绝对路径)" }),
         title: Type.String({ description: "Windows Terminal 窗口的标题" }),
         task: Type.String({ description: "初始任务需求与指令说明" }),
@@ -847,7 +869,7 @@ export class MultiWorkerCoordinator {
     const task = inst?.taskState ?? "unknown";
     const lifecycle = inst?.lifecycleState ?? "unknown";
     const title = inst?.title ? ` | 标题: ${truncateForList(inst.title, 40)}` : "";
-    return `${entry.workerId} (任务: ${task} | 状态: ${lifecycle}${title})`;
+    return `${entry.workerId} (角色: ${entry.role} | 任务: ${task} | 状态: ${lifecycle}${title})`;
   }
 
   /** 解析用户命令参数中的 workerId（取首个空白分隔 token） */
@@ -911,7 +933,7 @@ export class MultiWorkerCoordinator {
     const model = inst.modelId ? ` | 模型: ${inst.modelId}` : "";
     const provider = inst.provider ? ` (${inst.provider})` : "";
     ctx.ui.notify(
-      `Worker: ${inst.workerId} | 任务: ${inst.taskState} | 状态: ${inst.lifecycleState} | 活动: ${inst.activityState} | rev: ${inst.revision}${model}${provider}\n` +
+      `Worker: ${inst.workerId} | 角色: ${entry.role} | 任务: ${inst.taskState} | 状态: ${inst.lifecycleState} | 活动: ${inst.activityState} | rev: ${inst.revision}${model}${provider}\n` +
         `标题: ${inst.title} | cwd: ${inst.cwd} | taskId: ${inst.taskId}`,
       "info",
     );

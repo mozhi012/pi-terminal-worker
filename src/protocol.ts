@@ -5,6 +5,20 @@
 
 export const PROTOCOL_VERSION = 1;
 
+export type WorkerRole = "worker" | "lead";
+
+/** 入口和内核共同强制角色边界，不依赖工具 schema 或提示词。 */
+export function resolveChildRole(value: unknown, parentRole = process.env.PI_TERMINAL_WORKER_ROLE): WorkerRole {
+  const role = value === undefined ? "worker" : value;
+  if (role !== "worker" && role !== "lead") {
+    throw new Error("role 必须是 worker 或 lead");
+  }
+  if (role === "lead" && parentRole !== undefined) {
+    throw new Error("只有顶层主控可以启动 lead；受控进程不能嵌套 lead");
+  }
+  return role;
+}
+
 // 协议限额与超时常量 (设计方案第 5 节)
 export const MAX_FRAME_SIZE = 1 * 1024 * 1024; // 1 MiB 单帧上限
 export const MAX_TASK_TEXT_SIZE = 256 * 1024;  // 256 KiB 任务文本上限
@@ -232,7 +246,7 @@ export interface ClosePayload {
 }
 
 export interface ActivityPayload {
-  state: "idle" | "busy" | "waiting_ui" | "unknown";
+  state: "idle" | "busy" | "waiting_ui" | "waiting_children" | "unknown";
   toolName?: string;
   modelId?: string;
 }
@@ -660,7 +674,7 @@ export function validatePayload(type: string, payload: unknown): unknown {
       return p;
     }
     case "activity": {
-      requireEnum(p.state, "state", ["idle", "busy", "waiting_ui", "unknown"]);
+      requireEnum(p.state, "state", ["idle", "busy", "waiting_ui", "waiting_children", "unknown"]);
       optionalString(p.toolName, "toolName", 256);
       optionalString(p.modelId, "modelId", 256);
       return p;

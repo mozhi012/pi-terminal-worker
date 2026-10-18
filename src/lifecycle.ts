@@ -2,7 +2,7 @@
  * 生命周期与代际管理、单实例互斥与资源幂等清理
  */
 
-import { ProtocolErrorCode } from "./protocol.js";
+import { ProtocolErrorCode, type WorkerRole } from "./protocol.js";
 
 export type WorkerLifecycleState =
   | "none"
@@ -29,9 +29,10 @@ export type WorkerTaskState =
   | "accepted"
   | "abandoned";
 
-export type WorkerActivityState = "idle" | "busy" | "waiting_ui" | "unknown";
+export type WorkerActivityState = "idle" | "busy" | "waiting_ui" | "waiting_children" | "unknown";
 
 export interface WorkerInstanceMetadata {
+  role: WorkerRole;
   controllerId: string;
   workerId: string;
   taskId: string;
@@ -98,6 +99,7 @@ export class SingleWorkerManager {
     taskId: string,
     cwd: string,
     title: string,
+    role: WorkerRole = "worker",
   ): WorkerInstanceMetadata {
     if (this.mutexLocked) {
       throw new Error(`当前正在处理其他状态转换，请稍候重试`);
@@ -114,6 +116,7 @@ export class SingleWorkerManager {
 
       const now = Date.now();
       const instance: WorkerInstanceMetadata = {
+        role,
         controllerId,
         workerId,
         taskId,

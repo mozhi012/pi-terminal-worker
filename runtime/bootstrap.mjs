@@ -7,6 +7,7 @@ import * as net from "node:net";
 import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { validateDescriptor, monitorOwner } from "./bootstrap-support.mjs";
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -26,7 +27,7 @@ function parseArgs() {
 
   try {
     const json = Buffer.from(descriptorB64, "base64url").toString("utf8");
-    return { descriptor: JSON.parse(json), title };
+    return { descriptor: validateDescriptor(JSON.parse(json)), title };
   } catch (err) {
     console.error("[bootstrap] 描述符解析失败:", err.message);
     process.exit(1);
@@ -52,6 +53,17 @@ let isExiting = false;
 let authenticated = false;
 /** 是否已发起过 launch；用独立布尔避免 spawn 抛错后仍可重复启动 */
 let launchRequested = false;
+let stopOwnerMonitor = () => {};
+// owner 消失后不依赖 Pi 的 shutdown 钩子；由 supervisor 终止 L2，随后子进程 exit 路径退出。
+stopOwnerMonitor = monitorOwner(descriptor.ownerPid, () => {
+  isExiting = true;
+  if (childProcess && childProcess.exitCode === null && childProcess.signalCode === null) {
+    terminateChild(true);
+  } else {
+    socket?.destroy();
+    process.exit(0);
+  }
+});
 
 /** 接收缓冲上限：超过即停止累积并销毁连接 (2 MiB) */
 const MAX_RECV_BUFFER_BYTES = 2 * 1024 * 1024;
@@ -106,14 +118,17 @@ function sendAck(replyTo, ok, error, code) {
 }
 
 function terminateChild(force) {
-  if (!childProcess || childProcess.killed) return;
+  if (!childProcess || childProcess.exitCode !== null || childProcess.signalCode !== null) return;
   if (force && process.platform === "win32") {
+    const fallback = () => childProcess?.kill("SIGKILL");
     try {
-      spawn("taskkill", ["/F", "/T", "/PID", String(childProcess.pid)], {
+      const killer = spawn("taskkill", ["/F", "/T", "/PID", String(childProcess.pid)], {
         stdio: "ignore",
       });
+      killer.on("error", fallback);
+      killer.on("exit", (code) => { if (code !== 0) fallback(); });
     } catch {
-      childProcess.kill("SIGKILL");
+      fallback();
     }
   } else {
     childProcess.kill(force ? "SIGKILL" : "SIGTERM");
@@ -168,7 +183,7 @@ function handleEnvelope(envelope) {
         shell: false,
         env: {
           ...process.env,
-          PI_TERMINAL_WORKER_ROLE: "worker",
+          PI_TERMINAL_WORKER_ROLE: descriptor.role ?? "worker",
           PI_TERMINAL_WORKER_CONTROLLER_ID: controllerId,
           PI_TERMINAL_WORKER_WORKER_ID: workerId,
           PI_TERMINAL_WORKER_PIPE_PATH: workerPipePath,
@@ -179,6 +194,7 @@ function handleEnvelope(envelope) {
       sendAck(id, true);
 
       childProcess.on("error", (err) => {
+        stopOwnerMonitor();
         sendEnvelope("launch_failed", { error: err.message });
       });
 
@@ -187,6 +203,7 @@ function handleEnvelope(envelope) {
       });
 
       childProcess.on("exit", (code, signal) => {
+        stopOwnerMonitor();
         isExiting = true;
         sendEnvelope("child_exit", {
           pid: childProcess ? childProcess.pid : 0,
@@ -201,6 +218,7 @@ function handleEnvelope(envelope) {
         }, 300);
       });
     } catch (err) {
+      stopOwnerMonitor();
       sendAck(id, false, err.message, "LAUNCH_FAILED");
       sendEnvelope("launch_failed", { error: err.message });
     }
