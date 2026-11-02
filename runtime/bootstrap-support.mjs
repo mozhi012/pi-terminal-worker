@@ -15,6 +15,24 @@ export function validateDescriptor(descriptor) {
   return descriptor;
 }
 
+/**
+ * 组装 Worker 进程环境。工具策略必须先清除再按本次 launch 设置：
+ * 受限的 lead 启动子实例时，子实例不能继承 lead 自己的策略。
+ */
+export function buildChildEnv(baseEnv, { role, controllerId, workerId, workerPipePath, workerToken, toolPolicy }) {
+  const env = {
+    ...baseEnv,
+    PI_TERMINAL_WORKER_ROLE: role ?? "worker",
+    PI_TERMINAL_WORKER_CONTROLLER_ID: controllerId,
+    PI_TERMINAL_WORKER_WORKER_ID: workerId,
+    PI_TERMINAL_WORKER_PIPE_PATH: workerPipePath,
+    PI_TERMINAL_WORKER_TOKEN: workerToken,
+  };
+  delete env.PI_TERMINAL_WORKER_TOOL_POLICY;
+  if (toolPolicy) env.PI_TERMINAL_WORKER_TOOL_POLICY = toolPolicy;
+  return env;
+}
+
 export function isProcessAlive(pid) {
   try {
     process.kill(pid, 0);

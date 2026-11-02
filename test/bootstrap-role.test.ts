@@ -11,6 +11,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const bootstrap = fileURLToPath(new URL("../runtime/bootstrap.mjs", import.meta.url));
 const fixture = fileURLToPath(new URL("./fixtures/role-pi-cli.mjs", import.meta.url));
 const noop = fileURLToPath(new URL("./fixtures/noop-pi-cli.mjs", import.meta.url));
+const crash = fileURLToPath(new URL("./fixtures/crash-pi-cli.mjs", import.meta.url));
 const base = { version: 1, controllerId: "c", workerId: "w", pipePath: "p", bootstrapToken: "t" };
 async function waitFor(predicate: () => unknown, timeout = 6500) {
   const start = Date.now();
@@ -162,6 +163,28 @@ describe("bootstrap role whitelist and owner monitoring", () => {
       await waitFor(() => hasExited(h.proc));
       assert.equal(h.proc.exitCode, 0);
       assert.ok(h.frames.some((e) => e.type === "child_exit"));
+    } finally { await h.cleanup(); }
+  });
+
+  it("主控强制终止后 bootstrap 以 0 退出，窗口才会关闭；child_exit 仍上报真实退出码", async () => {
+    const h = await startBootstrap("worker");
+    try {
+      await waitFor(() => h.frames.some((e) => e.type === "child_spawned"));
+      h.sockets[0].write(JSON.stringify({ id: "t1", type: "terminate", payload: { force: true } }) + "\n");
+      await waitFor(() => hasExited(h.proc));
+      assert.equal(h.proc.exitCode, 0);
+      const exit = h.frames.find((e) => e.type === "child_exit");
+      assert.ok(exit);
+      assert.notEqual(exit.payload.code, 0);
+    } finally { await h.cleanup(); }
+  });
+
+  it("child 崩溃时 bootstrap 保留非零退出码，窗口留着便于查看错误", async () => {
+    const h = await startBootstrap("worker", undefined, crash);
+    try {
+      await waitFor(() => hasExited(h.proc));
+      assert.equal(h.proc.exitCode, 3);
+      assert.equal(h.frames.find((e) => e.type === "child_exit").payload.code, 3);
     } finally { await h.cleanup(); }
   });
 

@@ -1,6 +1,6 @@
 {
   "name": "@mozhi0012/pi-terminal-worker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi coding agent extension for supervised worker Pi in independent Windows Terminal window with bi-directional IPC",
   "type": "module",
   "main": "./dist/extension.js",
@@ -68,5 +68,8 @@
     "@types/node": "^22.13.0",
     "typebox": "^1.3.27",
     "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
   }
 }

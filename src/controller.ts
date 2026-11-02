@@ -50,6 +50,7 @@ import {
   type ModelChangedPayload,
   THINKING_LEVELS,
 } from "./protocol.js";
+import { encodeToolPolicy, type ToolPolicy } from "./tool-policy.js";
 
 /**
  * 可静默淘汰的收件箱事件类型：只含高频、可重发的过程性事件。
@@ -1544,6 +1545,8 @@ export class ControllerManager {
     bootstrapToken?: string;
     workerToken?: string;
     launchTimeoutMs?: number;
+    /** team.yaml 解析出的工具策略；只走内部参数，模型无法通过工具入参伪造 */
+    toolPolicy?: ToolPolicy;
   } = {}): Promise<{
     ok: boolean;
     workerId: string;
@@ -1668,6 +1671,7 @@ export class ControllerManager {
         provider: modelParams.provider,
         model: modelParams.model,
         thinkingLevel: modelParams.thinkingLevel,
+        ...(internal.toolPolicy ? { toolPolicy: encodeToolPolicy(internal.toolPolicy) } : {}),
       };
 
       await this.supervisorConn!.sendRequest({

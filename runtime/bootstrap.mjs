@@ -7,7 +7,7 @@ import * as net from "node:net";
 import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { validateDescriptor, monitorOwner } from "./bootstrap-support.mjs";
+import { validateDescriptor, monitorOwner, buildChildEnv } from "./bootstrap-support.mjs";
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -53,6 +53,8 @@ let isExiting = false;
 let authenticated = false;
 /** 是否已发起过 launch；用独立布尔避免 spawn 抛错后仍可重复启动 */
 let launchRequested = false;
+/** 主控已要求终止子进程；此后子进程的退出属于预期内 */
+let terminateRequested = false;
 let stopOwnerMonitor = () => {};
 // owner 消失后不依赖 Pi 的 shutdown 钩子；由 supervisor 终止 L2，随后子进程 exit 路径退出。
 stopOwnerMonitor = monitorOwner(descriptor.ownerPid, () => {
@@ -94,6 +96,9 @@ function validateLaunchPayload(payload) {
     if (!isNonEmptyString(value, 512)) {
       return { ok: false, field };
     }
+  }
+  if (payload.toolPolicy !== undefined && payload.toolPolicy !== null && !isNonEmptyString(payload.toolPolicy, 16 * 1024)) {
+    return { ok: false, field: "toolPolicy" };
   }
   return { ok: true };
 }
@@ -168,7 +173,7 @@ function handleEnvelope(envelope) {
     // 先置位再 spawn：spawn 抛错后也不允许再次 launch，避免重复子进程歧义
     launchRequested = true;
     try {
-      const { cwd, nodePath, piCliPath, extensionPath, workerToken, workerPipePath, provider, model, thinkingLevel } = payload;
+      const { cwd, nodePath, piCliPath, extensionPath, workerToken, workerPipePath, provider, model, thinkingLevel, toolPolicy } = payload;
 
       // 可选模型参数：不传时保持 Pi 默认设置，不硬编码任何模型
       // 正常加载用户、项目与内置扩展，同时确保 Worker 通信扩展可用。
@@ -181,14 +186,14 @@ function handleEnvelope(envelope) {
         cwd,
         stdio: "inherit",
         shell: false,
-        env: {
-          ...process.env,
-          PI_TERMINAL_WORKER_ROLE: descriptor.role ?? "worker",
-          PI_TERMINAL_WORKER_CONTROLLER_ID: controllerId,
-          PI_TERMINAL_WORKER_WORKER_ID: workerId,
-          PI_TERMINAL_WORKER_PIPE_PATH: workerPipePath,
-          PI_TERMINAL_WORKER_TOKEN: workerToken,
-        },
+        env: buildChildEnv(process.env, {
+          role: descriptor.role,
+          controllerId,
+          workerId,
+          workerPipePath,
+          workerToken,
+          toolPolicy,
+        }),
       });
 
       sendAck(id, true);
@@ -211,10 +216,12 @@ function handleEnvelope(envelope) {
           signal,
         });
 
-        // 留出时间让退出消息刷入管道，然后退出
+        // 留出时间让退出消息刷入管道，然后退出。
+        // 主控要求的终止按正常退出处理：taskkill 的退出码是 1，透传会让 Windows Terminal 保留窗口；
+        // 真实崩溃保留非零退出码，窗口留着便于查看错误。真实退出码已在 child_exit 中上报。
         setTimeout(() => {
           if (socket) socket.destroy();
-          process.exit(code ?? 0);
+          process.exit(terminateRequested ? 0 : (code ?? 0));
         }, 300);
       });
     } catch (err) {
@@ -231,6 +238,7 @@ function handleEnvelope(envelope) {
       return;
     }
     sendAck(id, true);
+    terminateRequested = true;
     terminateChild(payload && payload.force);
     return;
   }

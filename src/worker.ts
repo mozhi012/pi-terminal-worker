@@ -36,6 +36,7 @@ import {
 } from "./protocol.js";
 import { JsonlConnection } from "./transport.js";
 import { SessionGenerationManager } from "./lifecycle.js";
+import { evaluateToolCall, isToolHidden, loadToolPolicyFromEnv, type ToolPolicy } from "./tool-policy.js";
 
 const FORBIDDEN_WORKER_TOOLS = new Set([
   "subagent",
@@ -95,6 +96,7 @@ export class WorkerManager {
 
   private readonly role: WorkerRole;
   private readonly getActiveChildCount: () => number;
+  private readonly toolPolicy: ToolPolicy | null = loadToolPolicyFromEnv();
 
   constructor(private pi: ExtensionAPI, strictProtocol = false, options: WorkerManagerOptions = {}) {
     this.strictProtocol = strictProtocol;
@@ -653,7 +655,8 @@ export class WorkerManager {
       }
 
       this.pi.setActiveTools(
-        this.pi.getActiveTools().filter((name) => !FORBIDDEN_WORKER_TOOLS.has(name)),
+        this.pi.getActiveTools().filter((name) =>
+          !FORBIDDEN_WORKER_TOOLS.has(name) && !(this.toolPolicy && isToolHidden(this.toolPolicy, name))),
       );
       // hello_ok 可能尚未到达或已到达；两种时序下均由双条件门控发送 worker_ready
       this.trySendWorkerReady();
@@ -716,6 +719,11 @@ export class WorkerManager {
     });
 
     this.pi.on("tool_call", async (event) => {
+      // 工具策略先于会话代际判断：任何时序下都不能绕过角色权限
+      if (this.toolPolicy) {
+        const reason = evaluateToolCall(this.toolPolicy, event.toolName, event.input);
+        if (reason) return { block: true, reason };
+      }
       const gen = this.activeGeneration;
       if (!this.isCurrentGeneration(gen) || !this.currentContext) {
         this.staleCallbacksIgnored++;

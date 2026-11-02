@@ -36,6 +36,7 @@ import {
 } from "./controller.js";
 import { ProtocolErrorCode, resolveChildRole, type WorkerRole } from "./protocol.js";
 import type { WorkerInstanceMetadata } from "./lifecycle.js";
+import { resolveTeamStart } from "./team-config.js";
 
 /** close 结果类型 (与 ControllerManager.handleWorkerClose 一致) */
 type CloseResult = { ok: boolean; disposition: string; message: string };
@@ -43,6 +44,9 @@ type CloseResult = { ok: boolean; disposition: string; message: string };
 /** 协调器内登记的一个 Worker 实例 */
 export interface WorkerEntry {
   readonly role: WorkerRole;
+  /** 通过 team.yaml 启动时的 team 和角色名 */
+  readonly team?: string;
+  readonly teamRole?: string;
   readonly controllerId: string;
   readonly workerId: string;
   readonly taskId: string;
@@ -83,6 +87,9 @@ export interface MultiWorkerCoordinatorOptions {
 }
 
 export interface WorkerStartParams {
+  /** skill 目录名，配合 teamRole 从其 team.yaml 解析模型与权限 */
+  team?: string;
+  teamRole?: string;
   role?: WorkerRole;
   cwd: string;
   title: string;
@@ -98,6 +105,8 @@ export interface WorkerStartParams {
 /** worker_list 单条有界摘要（不含报告/事件明细，明细仍走 worker_status） */
 export interface WorkerListSummary {
   role: WorkerRole;
+  team?: string;
+  teamRole?: string;
   workerId: string;
   taskId: string;
   title: string;
@@ -197,15 +206,39 @@ export class MultiWorkerCoordinator {
   public getActiveChildCount(): number {
     let count = 0;
     for (const entry of this.entries.values()) {
-      const inst = entry.controller.workerManager.getInstance();
-      if (inst) {
-        if (entry.controller.workerManager.hasActiveInstance() &&
-            inst.taskState !== "accepted" && inst.taskState !== "abandoned") count++;
-      } else if (entry.startPromise) {
-        count++;
-      }
+      if (this.isEntryActive(entry)) count++;
     }
     return count;
+  }
+
+  private isEntryActive(entry: WorkerEntry): boolean {
+    const inst = entry.controller.workerManager.getInstance();
+    if (inst) {
+      return entry.controller.workerManager.hasActiveInstance() &&
+        inst.taskState !== "accepted" && inst.taskState !== "abandoned";
+    }
+    return entry.startPromise !== null;
+  }
+
+  /** team.yaml 的数量上限；调用方须与登记在同一轮事件循环内完成，避免并发超限 */
+  private assertTeamCapacity(team: string, teamRole: string, maxConcurrent?: number, maxForRole?: number): void {
+    let teamCount = 0;
+    let roleCount = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.team !== team || !this.isEntryActive(entry)) continue;
+      teamCount++;
+      if (entry.teamRole === teamRole) roleCount++;
+    }
+    if (maxConcurrent !== undefined && teamCount >= maxConcurrent) {
+      throw new Error(
+        `[TEAM_LIMIT_REACHED] team ${team} 已有 ${teamCount} 个存活实例，达到 limits.maxConcurrent=${maxConcurrent}。请先关闭已有实例或修改 team.yaml`,
+      );
+    }
+    if (maxForRole !== undefined && roleCount >= maxForRole) {
+      throw new Error(
+        `[TEAM_LIMIT_REACHED] 角色 ${team}/${teamRole} 已有 ${roleCount} 个存活实例，达到 max=${maxForRole}。请先关闭已有实例或修改 team.yaml`,
+      );
+    }
   }
 
   /** 当前登记实例数量 */
@@ -235,6 +268,7 @@ export class MultiWorkerCoordinator {
     const inst = entry.controller.workerManager.getInstance();
     return {
       role: entry.role,
+      ...(entry.team ? { team: entry.team, teamRole: entry.teamRole } : {}),
       workerId: entry.workerId,
       taskId: entry.taskId,
       title: truncateForList(inst?.title ?? "", WORKER_LIST_MAX_TITLE),
@@ -375,16 +409,20 @@ export class MultiWorkerCoordinator {
     taskId: string;
     revision: number;
     message: string;
+    team?: { name: string; role: string; provider: string; model: string; thinkingLevel: string; write: string; configPath: string };
   }> {
     // dispose 一旦开始就不再接受新的启动，避免清理后重新创建 pipe/定时器
     if (this.isDisposed) {
       throw new Error(`[${ProtocolErrorCode.INVALID_STATE}] 协调器已释放，不能再启动新的 Worker`);
     }
-    const role = resolveChildRole(params.role);
+    const team = resolveTeamStart(params);
+    const role = resolveChildRole(team ? team.tier : params.role);
+    if (team) this.assertTeamCapacity(team.team, team.teamRole, team.maxConcurrent, team.maxForRole);
     const ids = this.generateUniqueIdentity();
     const controller = this.createController();
     const entry: WorkerEntry = {
       role,
+      ...(team ? { team: team.team, teamRole: team.teamRole } : {}),
       controllerId: ids.controllerId,
       workerId: ids.workerId,
       taskId: ids.taskId,
@@ -404,7 +442,14 @@ export class MultiWorkerCoordinator {
     const epoch = this.epoch;
 
     // 在途 start 由 entry 自己持有：dispose 可对每个实例独立取消+等待，互不阻塞
-    const startPromise = controller.handleWorkerStart({ ...params, role }, {}, { ids });
+    const { team: _team, teamRole: _teamRole, ...startParams } = params;
+    const startPromise = controller.handleWorkerStart(
+      team
+        ? { ...startParams, role, provider: team.provider, model: team.model, thinkingLevel: team.thinkingLevel }
+        : { ...startParams, role },
+      {},
+      { ids, toolPolicy: team?.policy },
+    );
     entry.startPromise = startPromise;
     try {
       const res = await startPromise;
@@ -414,6 +459,19 @@ export class MultiWorkerCoordinator {
         taskId: entry.taskId,
         revision: res.revision,
         message: res.message,
+        ...(team
+          ? {
+              team: {
+                name: team.team,
+                role: team.teamRole,
+                provider: team.provider,
+                model: team.model,
+                thinkingLevel: team.thinkingLevel,
+                write: team.write,
+                configPath: team.configPath,
+              },
+            }
+          : {}),
       };
     } catch (err: unknown) {
       // 仅“进程已确认退出/参数未创建进程” (名额已释放) 才回收本次登记；
@@ -672,6 +730,8 @@ export class MultiWorkerCoordinator {
         "Worker 的关键事件（交付/提问/阻塞/停止/断连等）会主动唤醒本会话：空闲时开新轮，忙碌时 followUp 排队，无需轮询。",
       executionMode: "parallel",
       parameters: Type.Object({
+        team: Type.Optional(Type.String({ description: "可选：skill 目录名。与 teamRole 同时提供时，模型、层级和权限都从该 skill 的 team.yaml 解析，此时不能再传 role、provider、model、thinkingLevel" })),
+        teamRole: Type.Optional(Type.String({ description: "可选：team.yaml 中定义的角色名" })),
         role: Type.Optional(Type.Union([Type.Literal("worker"), Type.Literal("lead")], { description: "角色，默认 worker；仅顶层主控可启动 lead" })),
         cwd: Type.String({ description: "Worker 工作的根目录 (必须为绝对路径)" }),
         title: Type.String({ description: "Windows Terminal 窗口的标题" }),

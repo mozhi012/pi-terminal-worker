@@ -43,6 +43,49 @@ pi -e E:/web/pi-terminal-worker
 
 Worker 侧握手时序防护：`worker_ready` 必须等 `hello_ok` 认证确认且 `session_start` 就绪后发送，两者无论谁先到均保证发送一次，不会把 ready 丢在认证前。
 
+## 用 team.yaml 配置角色（0.3.0）
+
+把角色的模型、权限和数量上限写进 skill 目录，由插件校验并强制执行，skill 正文只需引用角色名：
+
+```yaml
+# ~/.pi/agent/skills/<team>/team.yaml
+version: 1
+limits:
+  maxConcurrent: 3        # 可选：本 team 在当前主控会话内同时存活的实例上限
+roles:
+  reviewer:
+    provider: magpie
+    model: antigravity/gemini-4-argon
+    thinking: high
+    write: none           # none | scoped | any
+    max: 1                # 可选：本角色同时存活的实例上限
+  implementer:
+    tier: worker          # 可选：worker（默认）或 lead
+    provider: magpie
+    model: codex/gpt-6.1-sol
+    thinking: high
+    write: scoped
+    denyTools: ["mcp__*__execute_sql"]   # 可选：额外禁用的工具，支持 * 通配
+```
+
+调用方式：`worker_start({ team: "dev-small", teamRole: "reviewer", cwd, title, task })`。返回值的 `team` 字段是解析结果；**没有这个字段说明插件版本低于 0.3.0**，旧版本会忽略 `team` 并使用默认模型。
+
+规则：
+
+- 使用 `team` 时不能再传 `role`、`provider`、`model`、`thinkingLevel`，要改就改 `team.yaml`。文件有未知字段或取值非法时，启动直接失败。
+- 每次 `worker_start` 都重新读取文件，修改后下一次启动生效。
+- 只读取用户级 skill 目录（`PI_CODING_AGENT_DIR` 或 `~/.pi/agent`），不读工作目录下的 `.pi`：目标目录可能尚未被信任，项目文件不能决定模型和写权限。
+- `write: scoped` 必须提供 `allowedPaths`（文件、目录，可带 `/**` 后缀，不支持其他通配符）；`write: none` 不能提供。
+
+权限在 Worker 进程的 `tool_call` 钩子中执行，`codemode` 里的嵌套调用同样受约束。这是防止模型误操作的护栏，**不是安全沙箱**：
+
+- `write`、`edit`、`code_rewrite` 按路径精确判断，会解开符号链接。
+- `write: none` 对 `bash` 只能启发式识别常见写命令和输出重定向；`python -c`、`bash -c "..."`、`npm run` 脚本内部的写入识别不到。
+- `write: scoped` 不判断 `bash` 的写入路径。
+- 调用方不传 `team` 时仍可自选模型，只有使用 `team` 的调用受约束。
+
+真实窗口验证：`npm run build && node test/e2e-team.mjs [provider] [model]`。
+
 ## 工具与命令
 
 ### 主控侧工具 (LLM 可调用)

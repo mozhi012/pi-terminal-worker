@@ -3,6 +3,8 @@
  * 双向命名管道 JSONL 通讯
  */
 
+import { MAX_TOOL_POLICY_SIZE } from "./tool-policy.js";
+
 export const PROTOCOL_VERSION = 1;
 
 export type WorkerRole = "worker" | "lead";
@@ -178,6 +180,8 @@ export interface LaunchPayload {
   model?: string;
   /** 可选：思考级别 off|minimal|low|medium|high|xhigh|max */
   thinkingLevel?: string;
+  /** 可选：team.yaml 解析出的工具策略 (JSON)，由 bootstrap 写入 Worker 环境变量 */
+  toolPolicy?: string;
 }
 
 export interface TerminatePayload {
@@ -588,6 +592,7 @@ export function validatePayload(type: string, payload: unknown): unknown {
       requireString(p.workerPipePath, "workerPipePath", MAX_PATH_FIELD_SIZE);
       optionalString(p.provider, "provider", 256);
       optionalString(p.model, "model", 256);
+      optionalString(p.toolPolicy, "toolPolicy", MAX_TOOL_POLICY_SIZE);
       const thinkingLevel = optionalString(p.thinkingLevel, "thinkingLevel", 256);
       if (thinkingLevel !== undefined && !(THINKING_LEVELS as readonly string[]).includes(thinkingLevel)) {
         throw new ProtocolValidationError(
