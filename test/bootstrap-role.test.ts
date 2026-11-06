@@ -14,9 +14,9 @@ const noop = fileURLToPath(new URL("./fixtures/noop-pi-cli.mjs", import.meta.url
 const crash = fileURLToPath(new URL("./fixtures/crash-pi-cli.mjs", import.meta.url));
 const base = { version: 1, controllerId: "c", workerId: "w", pipePath: "p", bootstrapToken: "t" };
 async function waitFor(predicate: () => unknown, timeout = 6500) {
-  const start = Date.now();
+  const start = performance.now();
   while (!predicate()) {
-    if (Date.now() - start > timeout) throw new Error("等待 bootstrap 条件超时");
+    if (performance.now() - start > timeout) throw new Error("等待 bootstrap 条件超时");
     await new Promise((resolve) => setTimeout(resolve, 15));
   }
 }

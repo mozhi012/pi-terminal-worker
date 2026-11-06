@@ -8,6 +8,10 @@ import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { validateDescriptor, monitorOwner, buildChildEnv } from "./bootstrap-support.mjs";
+import { closeHerdrPane, killProcessTree } from "./terminal-support.mjs";
+
+// Last action on every exit path, including invalid descriptors and lost lead owners.
+process.once("exit", () => closeHerdrPane());
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -135,9 +139,17 @@ function terminateChild(force) {
     } catch {
       fallback();
     }
+  } else if (force) {
+    try { killProcessTree(childProcess.pid); }
+    catch { childProcess.kill("SIGKILL"); }
   } else {
-    childProcess.kill(force ? "SIGKILL" : "SIGTERM");
+    childProcess.kill("SIGTERM");
   }
+}
+
+function exitAfterFlush(code = 1) {
+  isExiting = true;
+  setTimeout(() => { socket?.destroy(); process.exit(code); }, 300);
 }
 
 function handleEnvelope(envelope) {
@@ -168,6 +180,7 @@ function handleEnvelope(envelope) {
       const message = `launch payload 校验失败: ${validation.field}`;
       sendAck(id, false, message, "PROTOCOL_ERROR");
       sendEnvelope("launch_failed", { error: message });
+      exitAfterFlush();
       return;
     }
     // 先置位再 spawn：spawn 抛错后也不允许再次 launch，避免重复子进程歧义
@@ -201,6 +214,7 @@ function handleEnvelope(envelope) {
       childProcess.on("error", (err) => {
         stopOwnerMonitor();
         sendEnvelope("launch_failed", { error: err.message });
+        exitAfterFlush();
       });
 
       childProcess.on("spawn", () => {
@@ -228,6 +242,7 @@ function handleEnvelope(envelope) {
       stopOwnerMonitor();
       sendAck(id, false, err.message, "LAUNCH_FAILED");
       sendEnvelope("launch_failed", { error: err.message });
+      exitAfterFlush();
     }
     return;
   }
@@ -240,6 +255,7 @@ function handleEnvelope(envelope) {
     sendAck(id, true);
     terminateRequested = true;
     terminateChild(payload && payload.force);
+    if (!childProcess) exitAfterFlush(0);
     return;
   }
 }

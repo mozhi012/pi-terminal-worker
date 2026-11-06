@@ -29,6 +29,7 @@ export function buildChildEnv(baseEnv, { role, controllerId, workerId, workerPip
     PI_TERMINAL_WORKER_TOKEN: workerToken,
   };
   delete env.PI_TERMINAL_WORKER_TOOL_POLICY;
+  for (const key of Object.keys(env)) if (key.startsWith("PITW_BOOTSTRAP_")) delete env[key];
   if (toolPolicy) env.PI_TERMINAL_WORKER_TOOL_POLICY = toolPolicy;
   return env;
 }

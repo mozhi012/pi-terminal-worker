@@ -9,7 +9,9 @@ import { AckTimeoutError, getPipePath } from "../dist/transport.js";
 import { FakePiAPI } from "./fake-pi.ts";
 
 /** 固定终端探测，避免测试依赖真实 where 探测 */
+process.env.PI_TEST_MOCK_CLI = "1";
 const START_PROBES = {
+  platform: "win32" as const,
   findWt: () => "wt.exe" as string | null,
   findPowershell: () => null as string | null,
   findCmd: () => null as string | null,

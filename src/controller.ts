@@ -226,15 +226,7 @@ import {
 } from "./launcher.js";
 import { updateWorkerUiStatus, notifyWorker } from "./ui.js";
 
-class TerminalSpawnError extends Error {
-  public readonly cause: Error;
-
-  constructor(public readonly backend: string, cause: Error) {
-    super(`终端后端 ${backend} 启动失败: ${cause.message}`);
-    this.name = "TerminalSpawnError";
-    this.cause = cause;
-  }
-}
+import { launchMultiplexer, TerminalSpawnError, type TerminalCommandRunner, type TerminalHandle } from "./terminal-multiplexer.js";
 
 /**
  * Worker (子代理) 默认模型配置：`worker_start` 未显式指定 provider/model/thinkingLevel 时使用。
@@ -414,6 +406,19 @@ export class ControllerManager {
 
   /** 可注入的终端启动器，单元测试不实际开窗 */
   public launchSpawner: ((command: string, args: string[], options: SpawnOptions) => ChildProcess) | null = null;
+  public terminalRunner: TerminalCommandRunner | undefined;
+  private terminalHandle: TerminalHandle | null = null;
+  private terminalClosing: Promise<void> = Promise.resolve();
+  private terminalCleanup: (() => void) | null = null;
+
+  private closeTerminal(): Promise<void> {
+    const handle = this.terminalHandle;
+    this.terminalHandle = null;
+    this.terminalCleanup?.();
+    this.terminalCleanup = null;
+    if (handle) this.terminalClosing = handle.close();
+    return this.terminalClosing;
+  }
 
   constructor(
     private pi: ExtensionAPI,
@@ -1108,12 +1113,14 @@ export class ControllerManager {
           this.childExitConfirmed = true;
           this.workerManager.updateLifecycleState("closed");
           this.appendInbox("child_exit", p, undefined, undefined, undefined, { notify: !expectedExit });
+          void this.closeTerminal();
           this.stopHeartbeat();
         } else if (env.type === "launch_failed") {
           const p = env.payload as LaunchFailedPayload;
           this.childExitConfirmed = true;
           this.workerManager.updateLifecycleState("closed");
           this.appendInbox("launch_failed", p);
+          void this.closeTerminal();
         }
       } catch (err) {
         this.reportEnvelopeRejected(conn, env, err);
@@ -1621,39 +1628,39 @@ export class ControllerManager {
       };
       const descB64 = encodeDescriptor(desc);
 
-      const spec = buildTerminalLaunch(env, params.title, descB64);
-
       const terminalBackends = detectTerminalBackends(probes);
-      let launchedBackend = spec.backend;
-      let launchError: unknown = null;
-      this.assertStartActive(startGen);
-      let child = launchWorkerWindow(spec, { spawnFn: this.launchSpawner ?? undefined });
-
-      // 仅在 spawn 明确失败时回退。握手超时不是安全的回退信号，避免重复开窗。
-      try {
-        await this.waitForSupervisor(launchTimeoutMs, launchedBackend, child);
-      } catch (err: unknown) {
-        if (!(err instanceof TerminalSpawnError)) throw err;
-        launchError = err;
-        const startIndex = terminalBackends.findIndex((x) => x.backend === launchedBackend);
-        const fallback = terminalBackends.slice(startIndex + 1);
-        let lastError: unknown = err;
-        for (const backend of fallback) {
-          const fallbackEnv = { ...env, terminal: backend };
-          const fallbackSpec = buildTerminalLaunch(fallbackEnv, params.title, descB64);
-          try {
-            child = launchWorkerWindow(fallbackSpec, { spawnFn: this.launchSpawner ?? undefined });
-            launchedBackend = backend.backend;
-            await this.waitForSupervisor(launchTimeoutMs, launchedBackend, child);
-            launchError = null;
-            break;
-          } catch (fallbackErr: unknown) {
-            lastError = fallbackErr;
-            if (!(fallbackErr instanceof TerminalSpawnError)) throw fallbackErr;
+      for (let index = 0; index < terminalBackends.length; index++) {
+        const backend = terminalBackends[index];
+        this.assertStartActive(startGen);
+        const spec = buildTerminalLaunch({ ...env, terminal: backend }, params.title, descB64);
+        try {
+          let child: ChildProcess | undefined;
+          if (backend.backend === "herdr" || backend.backend === "tmux") {
+            const handle = await launchMultiplexer(spec, {
+              run: this.terminalRunner,
+              assertActive: () => this.assertStartActive(startGen),
+            });
+            try { this.assertStartActive(startGen); } catch (err) { await handle.close(); throw err; }
+            this.terminalHandle = handle;
+            this.terminalCleanup = this.cleanupRegistry.register(() => handle.close());
+            this.workerManager.setTerminalInfo({
+              backend: handle.backend, paneId: handle.paneId,
+              windowId: handle.windowId, sessionName: handle.sessionName,
+            });
+          } else {
+            try { child = launchWorkerWindow(spec, { spawnFn: this.launchSpawner ?? undefined }); }
+            catch (err) { throw new TerminalSpawnError(backend.backend, err instanceof Error ? err : new Error(String(err))); }
           }
-        }
-        if (launchError) {
-          throw lastError;
+          // Only explicit CLI/spawn failure permits fallback; a handshake timeout is ambiguous.
+          await this.waitForSupervisor(launchTimeoutMs, backend.backend, child, startGen);
+          this.assertStartActive(startGen);
+          break;
+        } catch (err) {
+          this.assertStartActive(startGen);
+          if (!(err instanceof TerminalSpawnError)) throw err;
+          await this.closeTerminal();
+          this.assertStartActive(startGen);
+          if (index === terminalBackends.length - 1) throw err;
         }
       }
 
@@ -1763,6 +1770,11 @@ export class ControllerManager {
         throw err;
       }
       const inst = this.workerManager.getInstance();
+      if (err instanceof TerminalSpawnError) {
+        this.workerManager.updateLifecycleState("closed");
+        this.workerManager.releaseSlot();
+        throw new Error(`[${ProtocolErrorCode.LAUNCH_FAILED}] ${err.message}`);
+      }
       if (inst?.lifecycleState === "closed") {
         // 「进程已确认退出」优先级高于「投递未知」：Supervisor 已明确上报
         // launch_failed / child_exit → 必须释放单实例名额；若同时存在投递未知，
@@ -1807,21 +1819,30 @@ export class ControllerManager {
     const onError = (err: Error) => {
       spawnError = new TerminalSpawnError(backend, err);
     };
+    const onExit = (code: number | null) => {
+      if (code !== null && code !== 0) onError(new Error(`启动命令退出码 ${code}`));
+    };
     child?.once?.("error", onError);
-
-    while (Date.now() - start < timeoutMs) {
-      if (this.isDisposed || !this.isCurrentGeneration(gen)) {
-        throw new Error("会话已切换，等待 Supervisor 握手已取消");
+    child?.once?.("exit", onExit);
+    if (child?.exitCode !== null && child?.exitCode !== undefined) onExit(child.exitCode);
+    try {
+      while (Date.now() - start < timeoutMs) {
+        if (this.isDisposed || !this.isCurrentGeneration(gen)) {
+          throw new Error("会话已切换，等待 Supervisor 握手已取消");
+        }
+        if (this.supervisorConn) return;
+        if (spawnError) throw spawnError;
+        await new Promise((r) => setTimeout(r, 200));
       }
-      if (this.supervisorConn) return;
       if (spawnError) throw spawnError;
-      await new Promise((r) => setTimeout(r, 200));
+      throw new Error(
+        `等待终端窗口与 Supervisor 握手超时 (${timeoutMs}ms，后端: ${backend})。` +
+          `为避免重复开窗，不会自动重开窗口；请检查新窗口是否已出现，可用 /worker-forget 手动解除占位。`,
+      );
+    } finally {
+      child?.removeListener?.("error", onError);
+      child?.removeListener?.("exit", onExit);
     }
-    if (spawnError) throw spawnError;
-    throw new Error(
-      `等待终端窗口与 Supervisor 握手超时 (${timeoutMs}ms，后端: ${backend})。` +
-        `为避免重复开窗，不会自动重开窗口；请检查新窗口是否已出现，可用 /worker-forget 手动解除占位。`,
-    );
   }
 
   /**
@@ -2263,6 +2284,7 @@ export class ControllerManager {
       );
     }
 
+    let closeTarget: TerminalHandle | null | undefined;
     const run = async (): Promise<{ ok: boolean; disposition: string; message: string }> => {
       const gen = this.activeGeneration;
       const inst = this.workerManager.getInstance();
@@ -2305,6 +2327,7 @@ export class ControllerManager {
       }
 
       this.workerManager.updateLifecycleState("closing");
+      closeTarget = this.terminalHandle;
 
       // 关闭指令的投递结果未知时记录请求 ID，供后续未确认退出的错误信息诊断
       let closeUnknownRequestId: string | null = null;
@@ -2377,6 +2400,8 @@ export class ControllerManager {
           "未确认 Worker 进程退出；保留单实例占位，请检查状态后重试关闭" + unknownSuffix,
         );
       }
+      await this.closeTerminal();
+      if (!this.isCurrentGeneration(gen)) throw new Error("会话已切换，关闭流程已终止");
       this.workerManager.releaseSlot();
       this.stopHeartbeat();
 
@@ -2396,6 +2421,9 @@ export class ControllerManager {
     try {
       return await promise;
     } finally {
+      // Even a missing/failed supervisor ACK must not leave an abandoned pane behind.
+      // Capture identity after validation so a stale close can never touch a new terminal.
+      if (closeTarget && this.terminalHandle === closeTarget) await this.closeTerminal();
       if (this.closeInFlight && this.closeInFlight.promise === promise) {
         this.closeInFlight = null;
       }
@@ -2416,13 +2444,13 @@ export class ControllerManager {
       name: "worker_start",
       label: "Worker Start",
       description:
-        "在独立的终端窗口 (Windows Terminal，缺失时回退 PowerShell/CMD) 中启动一个交互式 Worker Pi，派发初始任务并建立监督通信。" +
+        "在独立终端中启动交互式 Worker Pi（herdr pane、Linux tmux 或 Windows Terminal/PowerShell/CMD），派发初始任务并建立监督通信。" +
         "Worker 的关键事件（交付/提问/阻塞/停止/断连等）会主动唤醒本会话：空闲时开新轮，忙碌时 followUp 排队，无需轮询。",
       executionMode: "sequential",
       parameters: Type.Object({
         role: Type.Optional(Type.Union([Type.Literal("worker"), Type.Literal("lead")], { description: "角色，默认 worker；仅顶层主控可启动 lead" })),
         cwd: Type.String({ description: "Worker 工作的根目录 (必须为绝对路径)" }),
-        title: Type.String({ description: "Windows Terminal 窗口的标题" }),
+        title: Type.String({ description: "Worker 终端窗口或 pane 的标题" }),
         task: Type.String({ description: "初始任务需求与指令说明" }),
         context: Type.Optional(Type.String({ description: "任务背景与前置上下文" })),
         allowedPaths: Type.Optional(Type.Array(Type.String(), { description: "允许修改的文件或目录契约" })),
@@ -2630,6 +2658,8 @@ export class ControllerManager {
     this.isDisposed = false;
     this.closeInFlight = null;
 
+    // Capture cleanup before awaiting: never close a new generation's terminal.
+    const closePreviousTerminal = this.closeTerminal();
     // 结束上一会话的连接与 pipe 服务
     this.stopHeartbeat();
     this.resetStaleConnections();
@@ -2670,6 +2700,7 @@ export class ControllerManager {
     this.resetSessionScopedState();
 
     // 清空上一会话的清理器并复位，使本实例可被下一次会话继续复用
+    await closePreviousTerminal;
     await this.cleanupRegistry.disposeAll();
     this.cleanupRegistry.reset();
     this.serverCleanup = null;
@@ -2715,6 +2746,8 @@ export class ControllerManager {
       return;
     }
 
+    await this.closeTerminal();
+    if (!this.isCurrentGeneration(gen)) return;
     this.rejectWaiters(new Error("Controller 已关闭，等待已被取消"));
     this.resetSessionScopedState();
 

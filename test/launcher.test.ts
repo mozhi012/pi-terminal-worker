@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import * as assert from "node:assert";
 import * as path from "node:path";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import {
   encodeDescriptor,
   decodeDescriptor,
@@ -10,6 +12,7 @@ import {
   detectTerminalBackend,
   detectTerminalBackends,
   validateAndPrepareLaunch,
+  findPiCliPath,
   psQuote,
   windowsQuoted,
   assertCmdSafeValues,
@@ -17,7 +20,29 @@ import {
   type LaunchEnvironment,
 } from "../dist/launcher.js";
 
+process.env.PI_TEST_MOCK_CLI = "1";
 describe("Launcher and Descriptor Tests", () => {
+  it("Pi CLI override wins, then the active Pi entry supports user installation paths", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pitw-pi-entry-"));
+    const entry = path.join(root, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    fs.mkdirSync(path.dirname(entry), { recursive: true });
+    fs.writeFileSync(entry, "// fixture");
+    const previousEntry = process.argv[1];
+    const previousOverride = process.env.PI_TERMINAL_WORKER_PI_CLI_PATH;
+    try {
+      process.argv[1] = entry;
+      delete process.env.PI_TERMINAL_WORKER_PI_CLI_PATH;
+      assert.strictEqual(findPiCliPath(), fs.realpathSync(entry));
+      process.env.PI_TERMINAL_WORKER_PI_CLI_PATH = process.execPath;
+      assert.strictEqual(findPiCliPath(), process.execPath);
+    } finally {
+      process.argv[1] = previousEntry;
+      if (previousOverride === undefined) delete process.env.PI_TERMINAL_WORKER_PI_CLI_PATH;
+      else process.env.PI_TERMINAL_WORKER_PI_CLI_PATH = previousOverride;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("WorkerDescriptor 能正确进行 Base64Url 编解码且内容完全一致", () => {
     const desc: WorkerDescriptor = {
       version: 1,

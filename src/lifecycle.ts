@@ -39,6 +39,7 @@ export interface WorkerInstanceMetadata {
   cwd: string;
   title: string;
   childPid?: number;
+  terminal?: { backend: string; paneId?: string; windowId?: string; sessionName?: string };
   provider?: string;
   modelId?: string;
   thinkingLevel?: string;
@@ -172,6 +173,10 @@ export class SingleWorkerManager {
     if (!this.currentInstance) return;
     this.currentInstance.childPid = pid;
     this.currentInstance.updatedAt = Date.now();
+  }
+
+  public setTerminalInfo(terminal: NonNullable<WorkerInstanceMetadata["terminal"]>): void {
+    if (this.currentInstance) this.currentInstance.terminal = { ...terminal };
   }
 
   /**

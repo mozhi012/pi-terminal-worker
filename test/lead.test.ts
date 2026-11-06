@@ -9,6 +9,7 @@ import { resolveChildRole, validatePayload } from "../dist/protocol.js";
 import { encodeDescriptor, decodeDescriptor } from "../dist/launcher.js";
 import { FakePiAPI, FakePiContext } from "./fake-pi.ts";
 
+process.env.PI_TEST_MOCK_CLI = "1";
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const roleEnv = "PI_TERMINAL_WORKER_ROLE";
 function setRole(role?: string) {
@@ -389,7 +390,7 @@ describe("role startup descriptors", () => {
         (ctrl as any).waitForSupervisor = async () => { (ctrl as any).supervisorConn = makeConnection().conn; };
         (ctrl as any).waitForWorkerReady = async () => { (ctrl as any).workerConn = makeConnection().conn; };
         const result = await ctrl.handleWorkerStart({ cwd: process.cwd(), title: "test", task: "x", role: scenario.role as any }, {
-          findWt: () => "wt.exe", findPowershell: () => null, findCmd: () => null,
+          platform: "win32", findWt: () => "wt.exe", findPowershell: () => null, findCmd: () => null,
         });
         assert.equal(result.ok, true);
         assert.equal(captured.role, scenario.expected);

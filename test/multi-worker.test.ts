@@ -83,7 +83,9 @@ class FakeSocket extends EventEmitter {
   }
 }
 
+process.env.PI_TEST_MOCK_CLI = "1";
 const TEST_PROBES: Partial<TerminalProbes> = {
+  platform: "win32",
   findWt: () => "wt.exe",
   findPowershell: () => null,
   findCmd: () => null,

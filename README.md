@@ -1,14 +1,14 @@
 # pi-terminal-worker
 
-> 独立 Windows Terminal 窗口中的受控执行端 Pi 扩展，通过原生命名管道实现双向闭环通信与多实例监督调度。
+> 支持 Windows 和 Linux 的受控执行端 Pi 扩展，在 herdr pane、tmux 或独立 Windows 终端中运行 Worker，通过本地 IPC 实现双向闭环通信与多实例监督调度。
 
 ## 特性
 
 - **阶段主代理 lead（0.2.0）**：支持 `L0 主控 → L1 lead → L2 worker` 两层嵌套。lead 同时向上提交回执、向下派发并验收执行 Worker；禁止继续嵌套 lead。
 - **多 Worker 并发**：主代理可按需多次调用 `worker_start`，同一主 Pi 会话同时监督多个独立窗口中的 Worker；每个 Worker 拥有独立的窗口/进程、命名管道、两条连接、token、收件箱、报告缓存、心跳与关闭流程，互不串线。一个 Worker 失败、超时、断连或退出不影响其他 Worker。
-- **独立终端交互**：优先用 `wt.exe` 启动独立交互窗口；WT 缺失时自动回退 PowerShell (EncodedCommand 新控制台)，再回退 `cmd.exe /d /v:off`；均缺失时明确报错失败，不写任何临时任务文件。
+- **独立终端交互**：herdr 内优先在当前 tab 无焦点分屏；Linux 默认使用 tmux；Windows 依次选择 `wt.exe`、PowerShell 新控制台、CMD。无可用后端时明确报错，不写任何临时任务文件。
 - **正常扩展加载**：Worker 按 Pi 默认规则加载用户、项目与内置扩展，并显式加载本扩展以建立通信；不复制主会话临时传入的其他 `-e` 参数，项目扩展仍受 Pi 信任规则约束。
-- **纯内存管道通讯**：通过 Windows 原生命名管道（`\\.\pipe\...`）实现双向 JSONL 通信，不在磁盘生成任何临时任务文件（不写 `pi-tasks/`、`task.md`、`result.md`）。
+- **纯内存管道通讯**：通过 Windows 原生命名管道（`\\.\pipe\...`）或 Linux 临时目录中的 Unix socket 实现双向 JSONL 通信，不在磁盘生成任何临时任务文件（不写 `pi-tasks/`、`task.md`、`result.md`）。
 - **默认模型可配置**：Worker 默认使用 `antigravity` / `gemini-3.8-flash` / `thinking=high`（`worker_start` 未显式传参时生效）；可用环境变量 `PI_TERMINAL_WORKER_DEFAULT_PROVIDER` / `PI_TERMINAL_WORKER_DEFAULT_MODEL` / `PI_TERMINAL_WORKER_DEFAULT_THINKING` 覆盖。只影响新拉起的 Worker，不改动全局 Pi 设置、也不影响主 Pi 会话自身模型。
 - **模型状态实时上报**：Worker 在 `worker_ready` 上报实际 provider/modelId/thinkingLevel；会话内 `/model`、`/thinking` 切换后自动刷新主控端状态。
 - **状态三维分离**：严格区分生命周期（`launching/connected/closed` 等）、任务状态（`created/running/ready_for_review/accepted` 等）与 Pi 活动状态（`idle/busy`）。
@@ -33,13 +33,21 @@ pi -e E:/web/pi-terminal-worker
 
 ## 终端后端与回退
 
-`worker_start` 启动窗口时的探测顺序：
+`worker_start` 按当前环境选择后端：
+
+- **herdr**：`HERDR_ENV=1` 且有 `HERDR_PANE_ID` 时优先使用 herdr，在当前 tab 向右分屏，保持调用方焦点。通过 `process-info` 识别 PowerShell、CMD 或 POSIX shell，路径和描述符由 `--env` 传入。向右分屏避免额外布局查询带来的竞争，标题使用 `title`。bootstrap 退出时关闭自己的 pane，Controller 在退出、关闭、会话切换和 dispose 时幂等兜底。
+- **Linux tmux**：herdr 不可用时使用 tmux；在 tmux 内创建后台窗口，否则创建 `pitw-<workerId>` 后台会话，可用 `tmux attach -t <sessionName>` 查看。`worker_status.worker.terminal` 提供后端和 pane/window/session 标识。关闭时显式清理目标，即使启用了 `remain-on-exit` 也不留窗口。
+- **Windows**：herdr 不可用时按以下顺序启动独立控制台：
 
 1. **Windows Terminal**（`wt.exe`，PATH 或 `WindowsApps` 标准目录；可用 `PI_TERMINAL_WORKER_WT_PATH` 显式指定）；
 2. **PowerShell**（短命隐藏宿主 `powershell.exe -NoProfile -EncodedCommand`，脚本内 `Start-Process -FilePath node -WorkingDirectory cwd -WindowStyle Normal -ErrorAction Stop` 新建控制台直接跑 bootstrap，保证 Node stdin/stdout 为真实 TTY；`ArgumentList` 对 bootstrap 路径做 Windows 引号处理，PS 单引号段内 `& % !` 空格中文均为字面量）；
 3. **CMD**（`comspec` / `System32\cmd.exe`，固定命令串 `start "%ENV_TITLE%" /D "%ENV_CWD%" "%ENV_NODE%" "%ENV_BOOT%" --descriptor %ENV_DESC%` + `/d /v:off /s /c` + `windowsVerbatimArguments`，各值放受控环境变量、单次展开；拒绝值中的双引号/CR/LF/NUL，不做 `%%`/`^` 转义，原生路径的 `& % !` 在引号内保留）。
 
-三者都是独立可交互控制台，bootstrap/子进程退出或手动关窗后自动关闭。握手超时时**不会盲目重开窗口**，会报明确错误并保留单实例占位（可用 `/worker-forget` 人工解除）。
+Windows 三种后端均使用独立交互控制台。仅明确的启动失败（包括 herdr/tmux CLI 非零退出）会回退；握手超时时**不会盲目重开窗口**，会报明确错误并保留单实例占位（可用 `/worker-forget` 人工解除）。
+
+`PI_TERMINAL_WORKER_BACKEND=herdr` 或 `tmux` 可强制单个后端；逗号列表指定顺序（如 `tmux,herdr`），`!herdr` 可排除后端。仅使用列表中平台适用、上下文正确且可探测到的后端；无可用项或非法名称会明确报错。`PI_TERMINAL_WORKER_HERDR_PATH`、`PI_TERMINAL_WORKER_TMUX_PATH`、`PI_TERMINAL_WORKER_WT_PATH`、`PI_TERMINAL_WORKER_POWERSHELL_PATH` 可覆盖可执行文件路径。强制 herdr 仍须从 herdr pane 内运行。
+
+Pi CLI 优先使用 `PI_TERMINAL_WORKER_PI_CLI_PATH` 覆盖或当前 Pi 的真实入口，再查询 `npm root -g`；支持 nvm、用户 npm prefix 等安装方式。Linux `force=true` 通过 `/proc` 先冻结进程树、复扫，再自底向上强制结束，保留交互 TTY 的前台进程组。
 
 Worker 侧握手时序防护：`worker_ready` 必须等 `hello_ok` 认证确认且 `session_start` 就绪后发送，两者无论谁先到均保证发送一次，不会把 ready 丢在认证前。
 
@@ -141,7 +149,7 @@ worker_start({
 - lead 仍有未验收/放弃且未确认退出的 L2（含断连占位）时，空闲上报 `activity.state=waiting_children`，不会误报 `report_missing`。全部结束后，下一次 `agent_settled` 仍无回执则恢复原有缺报判定。
 - L2 关键事件用 custom message 唤醒 lead，L0 下发任务/补充用来源为 extension 的用户消息；两者均使用 `followUp`。L0 消息在 WorkerManager 内按到达顺序暂存，再交给 Pi 队列；L2 通知直接交给 Pi 队列，不保证两个通道的全局先后，但均不会被识别为人工输入或清除对方队列。真实键盘输入仍作废候选并清空上行待派发消息。
 - lead 的 `/worker-status` 查看 L2，`/lead-status` 查看自身与 L0 的受控连接，`/worker-detach` 仅断开上行连接；下行管理仍保留。
-- 正常关闭 lead 时，`session_shutdown` 会等待协调器并行尽力关闭所有 L2 并释放连接、定时器与状态栏。lead 强杀、崩溃或手动关窗后，仅由该 lead 派发的 L2 supervisor 通过描述符 `ownerPid` 每 4 秒执行 `process.kill(pid, 0)` 判活；确认 owner 不存在后终止 L2 子进程并退出，子进程退出时清理监测定时器。Windows 使用 `taskkill /F /T` 终止 L2 进程树。
+- 正常关闭 lead 时，`session_shutdown` 会等待协调器并行尽力关闭所有 L2 并释放连接、定时器与状态栏。lead 强杀、崩溃或手动关窗后，仅由该 lead 派发的 L2 supervisor 通过描述符 `ownerPid` 每 4 秒执行 `process.kill(pid, 0)` 判活；确认 owner 不存在后终止 L2 子进程并退出，子进程退出时清理监测定时器。Windows 使用 `taskkill /F /T`，Linux 使用冻结并复扫进程树后自底向上 `SIGKILL`；herdr pane 由 supervisor 退出清理覆盖 lead 已崩溃的情况。
 - 顶层 L0 直接启动的 worker/lead 不设置 owner PID，仍保持管道断开后可继续本地 TUI 的行为。PID 监测无法区分 PID 重用，权限不足时也不会认定 owner 已退出；这些情况需人工确认遗留进程。
 
 ### Worker 窗口内的模型切换
@@ -202,7 +210,7 @@ Worker 窗口是完整交互 Pi，可用 Pi 原生命令调整模型与思考级
 
 ## 限制
 
-- 目前仅支持 Windows。
+- 支持 Windows 和 Linux。Linux 需安装 herdr（在其 pane 内运行）或 tmux；不包含 Linux 图形终端后端。macOS 未专门验证。
 - 单个协调器同时管理多个 Worker；如需单实例限制，由调用方按 `workerId` 自行控制，并在 `/worker-status` 查看当前实例。
 - 不自动划分文件写入权限、不自动生成 worktree、不自动合并并发修改。
 - 不支持跨 Pi 进程的全局协调；`session_shutdown`/reload/进程重启后无法恢复旧注册表或监督，需先处理遗留进程再重新启动 Worker。

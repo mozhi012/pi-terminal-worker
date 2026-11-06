@@ -23,7 +23,7 @@ export interface WorkerDescriptor {
 /**
  * 可用终端后端：Windows Terminal 优先，缺失时依次回退 PowerShell 与 CMD
  */
-export type TerminalBackend = "wt" | "powershell" | "cmd";
+export type TerminalBackend = "herdr" | "tmux" | "wt" | "powershell" | "cmd";
 
 export interface TerminalBackendInfo {
   backend: TerminalBackend;
@@ -43,6 +43,10 @@ export interface LaunchEnvironment {
  * 可注入的探测函数集合，便于单元测试不依赖真实环境
  */
 export interface TerminalProbes {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  findHerdr?: () => string | null;
+  findTmux?: () => string | null;
   findWt: () => string | null;
   findPowershell: () => string | null;
   findCmd: () => string | null;
@@ -132,20 +136,62 @@ export function findCmdShell(): string | null {
  * 按 WT → PowerShell → CMD 顺序探测终端后端；全部缺失时返回 null (由调用方报明确错误)
  */
 export function detectTerminalBackends(probes: Partial<TerminalProbes> = {}): TerminalBackendInfo[] {
-  const p: TerminalProbes = {
-    findWt: probes.findWt ?? findWindowsTerminal,
-    findPowershell: probes.findPowershell ?? findPowershell,
-    findCmd: probes.findCmd ?? findCmdShell,
+  const platform = probes.platform ?? (process.env.PI_TEST_MOCK_PLATFORM as NodeJS.Platform | undefined) ?? process.platform;
+  const env = probes.env ?? process.env;
+  // Injected probes must never pick up a developer's real multiplexer session.
+  const injected = Object.keys(probes).length > 0;
+  const inHerdr = env.HERDR_ENV === "1" && !!env.HERDR_PANE_ID;
+  const defaults: TerminalBackend[] = [
+    ...(inHerdr ? ["herdr" as const] : []),
+    ...(platform === "win32" ? ["wt", "powershell", "cmd"] as const : ["tmux"] as const),
+  ];
+  const setting = env.PI_TERMINAL_WORKER_BACKEND;
+  let order = defaults;
+  if (setting !== undefined) {
+    const entries = setting.split(",").map((s) => s.trim());
+    const names = new Set(["herdr", "tmux", "wt", "powershell", "cmd"]);
+    if (entries.some((s) => !names.has(s.replace(/^!/, "")))) {
+      throw new Error(`无效的 PI_TERMINAL_WORKER_BACKEND: ${setting}`);
+    }
+    const excluded = new Set(entries.filter((s) => s.startsWith("!")).map((s) => s.slice(1)));
+    const selected = entries.filter((s) => !s.startsWith("!")) as TerminalBackend[];
+    order = [...new Set(selected.length ? selected : defaults)].filter((s) => !excluded.has(s));
+  }
+  const finders: Record<TerminalBackend, () => string | null> = {
+    herdr: probes.findHerdr ?? (injected ? () => null : () => findHerdr(env, platform)),
+    tmux: probes.findTmux ?? (injected ? () => null : () => findExecutable("tmux", env.PI_TERMINAL_WORKER_TMUX_PATH, platform)),
+    wt: probes.findWt ?? findWindowsTerminal,
+    powershell: probes.findPowershell ?? findPowershell,
+    cmd: probes.findCmd ?? findCmdShell,
   };
+  const result: TerminalBackendInfo[] = [];
+  for (const backend of order) {
+    if ((backend === "wt" || backend === "powershell" || backend === "cmd") && platform !== "win32") continue;
+    if (backend === "herdr" && !inHerdr) continue;
+    const command = finders[backend]();
+    if (command) result.push({ backend, command });
+  }
+  if (setting && !result.length && setting.split(",").some((s) => !s.trim().startsWith("!"))) {
+    throw new Error(`指定的终端后端不可用: ${setting}；herdr 需要 HERDR_ENV=1/HERDR_PANE_ID，` +
+      "请检查 PI_TERMINAL_WORKER_HERDR_PATH / PI_TERMINAL_WORKER_TMUX_PATH 和平台限制");
+  }
+  return result;
+}
 
-  const backends: TerminalBackendInfo[] = [];
-  const wt = p.findWt();
-  if (wt) backends.push({ backend: "wt", command: wt });
-  const ps = p.findPowershell();
-  if (ps) backends.push({ backend: "powershell", command: ps });
-  const cmd = p.findCmd();
-  if (cmd) backends.push({ backend: "cmd", command: cmd });
-  return backends;
+function findExecutable(name: string, override: string | undefined, platform = process.platform): string | null {
+  if (override) return fs.existsSync(override) ? override : null;
+  const found = spawnSync(platform === "win32" ? "where.exe" : "which", [name], {
+    encoding: "utf8", windowsHide: true, timeout: 5000,
+  });
+  return !found.error && found.status === 0 ? found.stdout.trim().split(/\r?\n/)[0] || null : null;
+}
+
+export function findHerdr(env = process.env, platform = process.platform): string | null {
+  const found = findExecutable(platform === "win32" ? "herdr.exe" : "herdr", env.PI_TERMINAL_WORKER_HERDR_PATH, platform);
+  if (found || env.PI_TERMINAL_WORKER_HERDR_PATH) return found;
+  const candidate = platform === "win32" && env.LOCALAPPDATA
+    ? path.join(env.LOCALAPPDATA, "Programs", "Herdr", "bin", "herdr.exe") : null;
+  return candidate && fs.existsSync(candidate) ? candidate : null;
 }
 
 export function detectTerminalBackend(probes: Partial<TerminalProbes> = {}): TerminalBackendInfo | null {
@@ -207,6 +253,22 @@ export function findWindowsTerminal(): string | null {
 export function findPiCliPath(): string | null {
   if (process.env.PI_TERMINAL_WORKER_PI_CLI_PATH && fs.existsSync(process.env.PI_TERMINAL_WORKER_PI_CLI_PATH)) {
     return process.env.PI_TERMINAL_WORKER_PI_CLI_PATH;
+  }
+
+  const entry = process.argv[1];
+  if (entry && fs.existsSync(entry)) {
+    const real = fs.realpathSync(entry);
+    if (/[/\\\\]@earendil-works[/\\\\]pi-coding-agent[/\\\\].*[/\\\\]cli\.js$/.test(real)) return real;
+  }
+  // Invoke npm's JS entry with this Node when available (also works with portable Node).
+  const npmCli = path.join(path.dirname(process.execPath), process.platform === "win32"
+    ? "node_modules/npm/bin/npm-cli.js" : "../lib/node_modules/npm/bin/npm-cli.js");
+  const root = fs.existsSync(npmCli)
+    ? spawnSync(process.execPath, [npmCli, "root", "-g"], { encoding: "utf8", windowsHide: true, timeout: 5000 })
+    : spawnSync("npm", ["root", "-g"], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+  if (!root.error && root.status === 0) {
+    const candidate = path.join(root.stdout.trim(), "@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    if (fs.existsSync(candidate)) return candidate;
   }
 
   const appData = process.env.APPDATA;
@@ -281,14 +343,6 @@ export function validateAndPrepareLaunch(
   targetCwd: string,
   probes: Partial<TerminalProbes> = {},
 ): LaunchEnvironment {
-  // 1. 检查操作系统 (测试环境下允许模拟)
-  const isWin = process.platform === "win32" || process.env.PI_TEST_MOCK_PLATFORM === "win32";
-  if (!isWin) {
-    throw new Error(
-      `pi-terminal-worker 目前仅支持 Windows 平台 (当前: ${process.platform})`,
-    );
-  }
-
   // 2. 校验 CWD
   if (!path.isAbsolute(targetCwd)) {
     throw new Error(`cwd 必须是绝对路径: "${targetCwd}"`);
@@ -309,8 +363,9 @@ export function validateAndPrepareLaunch(
       // 测试环境允许模拟 WT
     } else {
       throw new Error(
-        `未找到可用的终端后端 (已依次查找 wt.exe、powershell.exe、cmd.exe)。` +
-          `请安装 Windows Terminal 或保留 Windows PowerShell，或通过 PI_TERMINAL_WORKER_WT_PATH 指定 wt.exe。`,
+        `未找到可用的终端后端 (Windows: herdr/wt/powershell/cmd；Linux: herdr/tmux)。` +
+          `请安装平台适用的终端，检查 HERDR_ENV/HERDR_PANE_ID，或设置 PI_TERMINAL_WORKER_BACKEND、` +
+          `PI_TERMINAL_WORKER_HERDR_PATH / PI_TERMINAL_WORKER_TMUX_PATH / PI_TERMINAL_WORKER_WT_PATH。`,
       );
     }
   }
@@ -414,6 +469,9 @@ export interface TerminalLaunchSpec {
   windowsHide?: boolean;
   /** CMD 后端：args 即完整命令行，Node 不做任何二次引号处理 */
   windowsVerbatimArguments?: boolean;
+  /** Multiplexers start bootstrap in a real pane, then retain an explicit cleanup target. */
+  workerCommand?: string[];
+  tmuxSession?: string;
 }
 
 /**
@@ -433,6 +491,23 @@ export function buildTerminalLaunch(
   descriptorBase64Url: string,
 ): TerminalLaunchSpec {
   const t = env.terminal;
+
+  if (t.backend === "herdr") {
+    return { backend: "herdr", command: t.command, args: [], cwd: env.cwd, title,
+      workerCommand: [env.nodePath, env.bootstrapPath, "--descriptor", descriptorBase64Url] };
+  }
+  if (t.backend === "tmux") {
+    const session = `pitw-${decodeDescriptor(descriptorBase64Url).workerId}`;
+    if (!/^pitw-[a-zA-Z0-9_-]+$/.test(session)) throw new Error("非法 tmux Worker ID");
+    const inside = !!process.env.TMUX;
+    return {
+      backend: "tmux", command: t.command, cwd: env.cwd, title,
+      args: [inside ? "new-window" : "new-session", "-d", "-P", "-F", "#{window_id}",
+        ...(inside ? [] : ["-s", session]), "-n", title, "-c", env.cwd,
+        env.nodePath, env.bootstrapPath, "--descriptor", descriptorBase64Url],
+      ...(inside ? {} : { tmuxSession: session }),
+    };
+  }
 
   if (t.backend === "wt") {
     return {

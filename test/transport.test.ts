@@ -329,6 +329,10 @@ describe("2A: 传输层故障注入", () => {
     await new Promise<void>((resolve) => server.listen(pipePath, resolve));
 
     const client = net.createConnection(pipePath);
+    // Linux may reset a sender that still has buffered bytes after the receiver closes.
+    client.on("error", (error: NodeJS.ErrnoException) => {
+      assert.ok(error.code === "ECONNRESET" || error.code === "EPIPE", String(error));
+    });
     await new Promise<void>((resolve) => client.on("connect", resolve));
 
     client.write("a".repeat(2200 * 1024));

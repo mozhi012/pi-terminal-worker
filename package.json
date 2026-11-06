@@ -1,7 +1,7 @@
 {
   "name": "@mozhi0012/pi-terminal-worker",
   "version": "0.3.0",
-  "description": "Pi coding agent extension for supervised worker Pi in independent Windows Terminal window with bi-directional IPC",
+  "description": "Pi coding agent extension for supervised workers on Windows and Linux via herdr, tmux and Windows terminals with bi-directional IPC",
   "type": "module",
   "main": "./dist/extension.js",
   "types": "./dist/extension.d.ts",
@@ -23,6 +23,9 @@
     "pi-extension",
     "coding-agent",
     "windows-terminal",
+    "linux",
+    "herdr",
+    "tmux",
     "subagent",
     "worker"
   ],
