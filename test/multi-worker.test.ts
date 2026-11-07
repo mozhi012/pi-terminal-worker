@@ -537,6 +537,44 @@ describe("MultiWorkerCoordinator 阶段 A：登记、路由与隔离", () => {
     await teardown(h);
   });
 
+  it("非强制关闭超时且 pane 已关闭后，从 worker_list 移除并允许再次启动", async () => {
+    const h = createHarness();
+    let finishPaneClose = () => {};
+    try {
+      const a = await startAndComplete(h, { cwd: process.cwd(), title: "A", task: "任务A" });
+      a.controller.closeWaitTimeoutMs = 0;
+      a.workerSock.autoAckTypes.add("close");
+      let paneCloses = 0;
+      const paneClosed = new Promise<void>((resolve) => { finishPaneClose = resolve; });
+      (a.controller as any).terminalHandle = {
+        backend: "herdr",
+        close: async () => { paneCloses++; await paneClosed; },
+      };
+
+      const closing = h.coordinator.handleWorkerClose({ workerId: a.workerId, disposition: "abandoned" });
+      await waitFor(() => paneCloses === 1);
+      assert.strictEqual(a.controller.workerManager.getInstance()?.lifecycleState, "closing");
+      assert.strictEqual(a.controller.workerManager.hasActiveInstance(), true, "pane 关闭完成前不得释放名额");
+      finishPaneClose();
+      const result = await closing;
+
+      assert.strictEqual(result.ok, true);
+      assert.match(result.message, /未确认 Worker 进程退出/);
+      assert.strictEqual(paneCloses, 1);
+      assert.strictEqual(a.controller.workerManager.hasActiveInstance(), false);
+      assert.strictEqual(h.coordinator.getEntry(a.workerId), undefined);
+      assert.strictEqual(h.coordinator.size, 0);
+      assert.strictEqual((await h.coordinator.handleWorkerList()).total, 0);
+      assert.strictEqual(h.coordinator.getActiveChildCount(), 0);
+      const b = await startAndComplete(h, { cwd: process.cwd(), title: "B", task: "任务B" });
+      assert.strictEqual(b.controller.workerManager.getInstance()?.lifecycleState, "connected");
+      assert.strictEqual((await h.coordinator.handleWorkerList()).total, 1);
+    } finally {
+      finishPaneClose();
+      await teardown(h);
+    }
+  });
+
   it("dispose 清理所有登记实例且幂等", async () => {
     const h = createHarness();
     const a = await startAndComplete(h, { cwd: process.cwd(), title: "A", task: "任务A" });

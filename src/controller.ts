@@ -2392,13 +2392,23 @@ export class ControllerManager {
       }
 
       const confirmed = this.workerManager.getInstance();
+      let unconfirmedExitMessage: string | undefined;
       if (confirmed?.lifecycleState !== "closed") {
         const unknownSuffix = closeUnknownRequestId
           ? `；关闭指令送达未知 (req: ${closeUnknownRequestId})，结果待确认`
           : "";
-        throw new Error(
-          "未确认 Worker 进程退出；保留单实例占位，请检查状态后重试关闭" + unknownSuffix,
-        );
+        if (params.force || !closeTarget) {
+          throw new Error(
+            "未确认 Worker 进程退出；保留单实例占位，请检查状态后重试关闭" + unknownSuffix,
+          );
+        }
+        // 非强制关闭超时后仍会关闭终端：收敛到终态，避免留下永远 closing 的占位。
+        // closed 在此表示终端已关闭；不伪造 child_exit，返回值仍明确说明退出未确认。
+        await this.closeTerminal();
+        if (!this.isCurrentGeneration(gen)) throw new Error("会话已切换，关闭流程已终止");
+        this.workerManager.updateLifecycleState("closed");
+        unconfirmedExitMessage =
+          `Worker 终端已关闭并释放名额，但未确认 Worker 进程退出 (disposition: ${params.disposition})` + unknownSuffix;
       }
       await this.closeTerminal();
       if (!this.isCurrentGeneration(gen)) throw new Error("会话已切换，关闭流程已终止");
@@ -2408,7 +2418,7 @@ export class ControllerManager {
       return {
         ok: true,
         disposition: params.disposition,
-        message: `Worker 已关闭 (disposition: ${params.disposition})`,
+        message: unconfirmedExitMessage ?? `Worker 已关闭 (disposition: ${params.disposition})`,
       };
     };
 

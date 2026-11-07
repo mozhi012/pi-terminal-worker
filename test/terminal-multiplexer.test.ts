@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { buildTerminalLaunch, detectTerminalBackends, encodeDescriptor, validateAndPrepareLaunch, type LaunchEnvironment } from "../dist/launcher.js";
 import { buildHerdrRunCommand, launchMultiplexer, runTerminalCommand, TerminalSpawnError, type TerminalCommandRunner } from "../dist/terminal-multiplexer.js";
 import { ControllerManager } from "../dist/controller.js";
+import { AckTimeoutError } from "../dist/transport.js";
 import { FakePiAPI } from "./fake-pi.ts";
 import { closeHerdrPane, killProcessTree } from "../runtime/terminal-support.mjs";
 import { buildChildEnv } from "../runtime/bootstrap-support.mjs";
@@ -222,6 +223,58 @@ describe("Controller multiplexer lifecycle", () => {
       } finally { await ctrl.dispose(); restore(); }
     });
   }
+  for (const deliveryUnknown of [false, true]) {
+    it(`releases the slot after non-force close times out and closes its pane (deliveryUnknown=${deliveryUnknown})`, async () => {
+      const restore = envSet("PI_TEST_MOCK_CLI", "1");
+      const ctrl = controllerHarness();
+      const h = harness();
+      ctrl.terminalRunner = h.run;
+      ctrl.closeWaitTimeoutMs = 0;
+      try {
+        const started = await ctrl.handleWorkerStart({ cwd: process.cwd(), title: "t", task: "x" }, probes);
+        if (deliveryUnknown) {
+          (ctrl as any).workerConn.sendRequest = async (env: any) => { throw new AckTimeoutError(env.id, 1); };
+        }
+        const releasedStates: string[] = [];
+        const release = ctrl.workerManager.releaseSlot.bind(ctrl.workerManager);
+        ctrl.workerManager.releaseSlot = (force?: boolean) => {
+          assert.equal(h.calls.filter((args) => args[1] === "close").length, 1, "pane must close before releasing the slot");
+          releasedStates.push(ctrl.workerManager.getInstance()!.lifecycleState);
+          return release(force);
+        };
+
+        const result = await ctrl.handleWorkerClose({ workerId: started.workerId, disposition: "abandoned" });
+        assert.equal(result.ok, true, "terminal closure succeeds even without a process exit confirmation");
+        assert.match(result.message, /终端已关闭并释放名额.*未确认 Worker 进程退出/);
+        assert.deepEqual(releasedStates, ["closed"]);
+        assert.equal(ctrl.workerManager.getInstance(), null);
+        assert.equal(ctrl.workerManager.hasActiveInstance(), false);
+        assert.equal((ctrl as any).childExitConfirmed, false, "must not fabricate child_exit confirmation");
+        if (deliveryUnknown) {
+          const unknown = (ctrl as any).unknownDeliveries;
+          assert.equal(unknown.length, 1);
+          assert.match(result.message, /关闭指令送达未知/);
+          assert.ok(result.message.includes(unknown[0].requestId));
+        }
+        const next = ctrl.workerManager.acquireLaunchSlot("next-ctrl", "next-worker", "next-task", process.cwd(), "next");
+        assert.equal(next.workerId, "next-worker", "the single-instance slot must be reusable");
+      } finally { await ctrl.dispose(); restore(); }
+    });
+  }
+  it("retains the slot after force-close times out without child_exit", async () => {
+    const restore = envSet("PI_TEST_MOCK_CLI", "1");
+    const ctrl = controllerHarness();
+    const h = harness();
+    ctrl.terminalRunner = h.run;
+    ctrl.closeWaitTimeoutMs = 0;
+    try {
+      const started = await ctrl.handleWorkerStart({ cwd: process.cwd(), title: "t", task: "x" }, probes);
+      await assert.rejects(ctrl.handleWorkerClose({ workerId: started.workerId, disposition: "abandoned", force: true }), /未确认 Worker 进程退出/);
+      assert.equal(h.calls.filter((args) => args[1] === "close").length, 1);
+      assert.equal(ctrl.workerManager.getInstance()?.lifecycleState, "closing");
+      assert.ok(ctrl.workerManager.hasActiveInstance());
+    } finally { await ctrl.dispose(); restore(); }
+  });
   it("closes the terminal even when force-close cannot get a supervisor ACK", async () => {
     const restore = envSet("PI_TEST_MOCK_CLI", "1");
     const ctrl = controllerHarness();
