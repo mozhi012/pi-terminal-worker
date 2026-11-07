@@ -28,7 +28,7 @@ export interface TerminalHandle {
 
 /** Only controlled variable references are sent to the interactive shell. */
 export function buildHerdrRunCommand(shellName: string, values: Record<string, string>): string {
-  const shell = shellName.replace(/\\/g, "/").split("/").pop()!.toLowerCase().replace(/\.exe$/, "");
+  const shell = shellName.replace(/\\/g, "/").split("/").pop()!.replace(/^-/, "").toLowerCase().replace(/\.exe$/, "");
   if (shell === "powershell" || shell === "pwsh") {
     return "& $env:PITW_BOOTSTRAP_NODE $env:PITW_BOOTSTRAP_FILE --descriptor $env:PITW_BOOTSTRAP_DESC";
   }

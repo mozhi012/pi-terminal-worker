@@ -72,6 +72,7 @@ describe("Multiplexer launch and cleanup", () => {
     const values = { path: 'quote\' & $(touch bad) %PATH%! "' };
     assert.match(buildHerdrRunCommand("C:\\Program Files\\PowerShell\\7\\pwsh.exe", values), /^& \$env:/);
     for (const shell of ["bash", "/bin/zsh", "fish"]) assert.ok(!buildHerdrRunCommand(shell, values).includes("touch"));
+    for (const shell of ["-bash", "-zsh"]) assert.ok(buildHerdrRunCommand(shell, values).startsWith('"$PITW_BOOTSTRAP_NODE"'));
     assert.throws(() => buildHerdrRunCommand("cmd.exe", values), /双引号/);
     assert.match(buildHerdrRunCommand("cmd.exe", { path: "x & %y%!" }), /^"%PITW_BOOTSTRAP_NODE%"/);
     assert.throws(() => buildHerdrRunCommand("nu", values), /不支持/);
